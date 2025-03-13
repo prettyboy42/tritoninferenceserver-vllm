@@ -249,7 +249,15 @@ OpenCudaIPCRegion(
     const hipIpcMemHandle_t* cuda_shm_handle, void** data_ptr, int device_id)
 {
   // Set to device curres
-  hipSetDevice(device_id);
+  hipError_t err = hipSetDevice(device_id);
+  if (err != hipSuccess) {
+    // Log detailed error message and send generic error to client
+    LOG_ERROR << "failed to set CUDA device: " << hipGetErrorString(err);
+    return TRITONSERVER_ErrorNew(
+        TRITONSERVER_ERROR_INVALID_ARG,
+        std::string("failed to register shared memory region: invalid args")
+            .c_str());
+  }
 
   // Open CUDA IPC handle and read data from it
   hipError_t err = hipIpcOpenMemHandle(
