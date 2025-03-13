@@ -290,12 +290,12 @@ GetCudaDriverEntryPoint(const char* name, void** func_ptr)
 TRITONSERVER_Error*
 GetCudaSharedMemoryRegionSize(hipDeviceptr_t data_ptr, size_t& shm_region_size)
 {
-  // void* cu_mem_get_address_range = nullptr;
-  // void* cu_get_error_string = nullptr;
-  // RETURN_IF_ERR(GetCudaDriverEntryPoint(
-  //     "cuMemGetAddressRange", &cu_mem_get_address_range));
-  // RETURN_IF_ERR(
-  //     GetCudaDriverEntryPoint("cuGetErrorString", &cu_get_error_string));
+  void* hip_mem_get_address_range = nullptr;
+  void* hip_get_error_string = nullptr;
+  RETURN_IF_ERR(GetCudaDriverEntryPoint(
+      "hipMemGetAddressRange", &hip_mem_get_address_range));
+  RETURN_IF_ERR(
+      GetCudaDriverEntryPoint("hipGetErrorString", &hip_get_error_string));
 
   // CUdeviceptr* base = nullptr;
   // CUresult result = ((
