@@ -88,6 +88,17 @@ class Barrier {
   size_t generation_;
 };
 
+// Simple structure that carries the userp payload needed for
+// request release callback.
+struct RequestReleasePayload final {
+  explicit RequestReleasePayload(
+      const std::shared_ptr<TRITONSERVER_InferenceRequest>& inference_request)
+      : inference_request_(inference_request){};
+
+ private:
+  std::shared_ptr<TRITONSERVER_InferenceRequest> inference_request_ = nullptr;
+};
+
 //
 // ResponseQueue
 //
@@ -325,7 +336,8 @@ InferAllocatorPayload(
       TRITONSERVER_MemoryType memory_type;
       int64_t memory_type_id;
       RETURN_IF_ERR(shm_manager->GetMemoryInfo(
-          region_name, offset, &base, &memory_type, &memory_type_id));
+          region_name, offset, byte_size, &base, &memory_type,
+          &memory_type_id));
 
       if (memory_type == TRITONSERVER_MEMORY_GPU) {
 #ifdef TRITON_ENABLE_ROCM
@@ -462,6 +474,9 @@ InferResponseCompleteCommon(
         break;
       case TRITONSERVER_PARAMETER_STRING:
         param.set_string_param(reinterpret_cast<const char*>(vvalue));
+        break;
+      case TRITONSERVER_PARAMETER_DOUBLE:
+        param.set_double_param(*(reinterpret_cast<const double*>(vvalue)));
         break;
       case TRITONSERVER_PARAMETER_BYTES:
         return TRITONSERVER_ErrorNew(
@@ -715,15 +730,9 @@ class InferHandlerState {
     // Inserts the state to a set tracking active requests
     // within the server core. Should only be called when
     // the request was successfully enqueued on Triton.
-    void InsertInflightState(
-        InferHandlerStateType* state, TRITONSERVER_InferenceRequest* irequest)
+    void InsertInflightState(InferHandlerStateType* state)
     {
       std::lock_guard<std::recursive_mutex> lock(mu_);
-      // The irequest_ptr_ will get populated when it is
-      // marked as active which means the request has been
-      // successfully enqueued to Triton core using
-      // TRITONSERVER_ServerInferAsync.
-      state->irequest_ptr_ = irequest;
       inflight_states_.insert(state);
     }
 
@@ -748,7 +757,7 @@ class InferHandlerState {
           if (state->step_ != Steps::CANCELLED &&
               state->step_ != Steps::COMPLETE) {
             LOG_VERBOSE(1) << "Issuing cancellation for " << state->unique_id_;
-            if (state->irequest_ptr_ == nullptr) {
+            if (state->inference_request_.get() == nullptr) {
               // The context might be holding some states that have
               // not been issued to Triton core. Need to skip calling
               // issuing cancellation for such requests.
@@ -758,7 +767,8 @@ class InferHandlerState {
             // Assuming if RequestComplete callback is run asynchronously
             // before this point.
             TRITONSERVER_Error* err = nullptr;
-            err = TRITONSERVER_InferenceRequestCancel(state->irequest_ptr_);
+            err = TRITONSERVER_InferenceRequestCancel(
+                state->inference_request_.get());
             // TODO: Add request id to the message
             if (err != nullptr) {
               LOG_INFO << "Failed to cancel the request: "
@@ -1003,12 +1013,18 @@ class InferHandlerState {
       const std::shared_ptr<Context>& context, Steps start_step = Steps::START)
       : tritonserver_(tritonserver), async_notify_state_(false)
   {
-    // For debugging and testing,
+    // For debugging and testing
     const char* dstr = getenv("TRITONSERVER_DELAY_GRPC_RESPONSE");
     delay_response_ms_ = 0;
     if (dstr != nullptr) {
       delay_response_ms_ = atoi(dstr);
     }
+    const char* cstr = getenv("TRITONSERVER_DELAY_GRPC_COMPLETE");
+    delay_complete_ms_ = 0;
+    if (cstr != nullptr) {
+      delay_complete_ms_ = atoi(cstr);
+    }
+
     response_queue_.reset(new ResponseQueue<ResponseType>());
     Reset(context, start_step);
   }
@@ -1023,7 +1039,7 @@ class InferHandlerState {
     unique_id_ = NEXT_UNIQUE_ID;
     context_ = context;
     step_ = start_step;
-    irequest_ptr_ = nullptr;
+    status_ = ::grpc::Status{};
     cb_count_ = 0;
     is_decoupled_ = false;
     complete_ = false;
@@ -1042,6 +1058,7 @@ class InferHandlerState {
   void Release()
   {
     context_ = nullptr;
+    inference_request_.reset();
     ClearTraceTimestamps();
   }
 
@@ -1077,7 +1094,10 @@ class InferHandlerState {
   Steps step_;
   std::recursive_mutex step_mtx_;
 
-  TRITONSERVER_InferenceRequest* irequest_ptr_;
+  // Shared pointer to the inference request object. The lifetime of
+  // inference request object is extended till all the responses from
+  // the request are processed and the request is released.
+  std::shared_ptr<TRITONSERVER_InferenceRequest> inference_request_;
 
 #ifdef TRITON_ENABLE_TRACING
   std::shared_ptr<TraceManager::Trace> trace_;
@@ -1088,6 +1108,7 @@ class InferHandlerState {
   bool is_decoupled_ = false;
   StateParameters parameters_;
 
+  ::grpc::Status status_;
   std::atomic<uint32_t> cb_count_;
   bool complete_;
 
@@ -1098,6 +1119,7 @@ class InferHandlerState {
 
   // For testing and debugging
   int delay_response_ms_;
+  int delay_complete_ms_;
 
   // For inference requests the allocator payload, unused for other
   // requests.
@@ -1423,5 +1445,34 @@ class ModelInferHandler
 
   grpc_compression_level compression_level_;
 };
+
+#if !defined(_WIN32) && defined(TRITON_ENABLE_TRACING)
+class GrpcServerCarrier : public otel_cntxt::propagation::TextMapCarrier {
+ public:
+  GrpcServerCarrier(::grpc::ServerContext* context) : context_(context) {}
+  GrpcServerCarrier() = default;
+  virtual opentelemetry::nostd::string_view Get(
+      opentelemetry::nostd::string_view key) const noexcept override
+  {
+    auto it = context_->client_metadata().find({key.data(), key.size()});
+    if (it != context_->client_metadata().end()) {
+      return it->second.data();
+    }
+    return "";
+  }
+
+  // Not required on server side
+  virtual void Set(
+      opentelemetry::nostd::string_view key,
+      opentelemetry::nostd::string_view value) noexcept override
+  {
+    return;
+  }
+
+  ::grpc::ServerContext* context_;
+};
+#else
+using GrpcServerCarrier = void*;
+#endif  // TRITON_ENABLE_TRACING
 
 }}}  // namespace triton::server::grpc

@@ -1,4 +1,4 @@
-// Copyright 2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2023-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -327,6 +327,12 @@ SetInferenceRequestMetadata(
         RETURN_IF_ERR(TRITONSERVER_InferenceRequestSetStringParameter(
             inference_request, param.first.c_str(),
             infer_param.string_param().c_str()));
+      } else if (
+          infer_param.parameter_choice_case() ==
+          inference::InferParameter::ParameterChoiceCase::kDoubleParam) {
+        RETURN_IF_ERR(TRITONSERVER_InferenceRequestSetDoubleParameter(
+            inference_request, param.first.c_str(),
+            infer_param.double_param()));
       } else {
         return TRITONSERVER_ErrorNew(
             TRITONSERVER_ERROR_INVALID_ARG,
@@ -427,7 +433,7 @@ InferGRPCToInput(
       }
       void* tmp;
       RETURN_IF_ERR(shm_manager->GetMemoryInfo(
-          region_name, offset, &tmp, &memory_type, &memory_type_id));
+          region_name, offset, byte_size, &tmp, &memory_type, &memory_type_id));
       base = tmp;
       if (memory_type == TRITONSERVER_MEMORY_GPU) {
 #ifdef TRITON_ENABLE_ROCM
@@ -640,10 +646,11 @@ InferRequestComplete(
 {
   LOG_VERBOSE(1) << "ModelInferHandler::InferRequestComplete";
 
+  RequestReleasePayload* request_release_payload =
+      static_cast<RequestReleasePayload*>(userp);
+
   if ((flags & TRITONSERVER_REQUEST_RELEASE_ALL) != 0) {
-    LOG_TRITONSERVER_ERROR(
-        TRITONSERVER_InferenceRequestDelete(request),
-        "deleting GRPC inference request");
+    delete request_release_payload;
   }
 }
 
@@ -861,6 +868,12 @@ ModelInferHandler::Execute(InferHandler::State* state)
   }
 
   if (err == nullptr) {
+    state->inference_request_ = {
+        irequest, [](TRITONSERVER_InferenceRequest* request) {
+          LOG_TRITONSERVER_ERROR(
+              TRITONSERVER_InferenceRequestDelete(request),
+              "deleting gRPC inference request");
+        }};
     err = SetInferenceRequestMetadata(irequest, request, state->parameters_);
   }
 
@@ -881,9 +894,13 @@ ModelInferHandler::Execute(InferHandler::State* state)
         tritonserver_, shm_manager_, request, std::move(serialized_data),
         response_queue, &state->alloc_payload_);
   }
+
+  auto request_release_payload =
+      std::make_unique<RequestReleasePayload>(state->inference_request_);
   if (err == nullptr) {
     err = TRITONSERVER_InferenceRequestSetReleaseCallback(
-        irequest, InferRequestComplete, nullptr /* request_release_userp */);
+        irequest, InferRequestComplete,
+        request_release_payload.get() /* request_release_userp */);
   }
   if (err == nullptr) {
     err = TRITONSERVER_InferenceRequestSetResponseCallback(
@@ -905,8 +922,10 @@ ModelInferHandler::Execute(InferHandler::State* state)
   if (err == nullptr) {
     TRITONSERVER_InferenceTrace* triton_trace = nullptr;
 #ifdef TRITON_ENABLE_TRACING
-    state->trace_ =
-        std::move(trace_manager_->SampleTrace(request.model_name()));
+    GrpcServerCarrier carrier(state->context_->ctx_.get());
+    auto start_options =
+        trace_manager_->GetTraceStartOptions(carrier, request.model_name());
+    state->trace_ = std::move(trace_manager_->SampleTrace(start_options));
     if (state->trace_ != nullptr) {
       triton_trace = state->trace_->trace_;
     }
@@ -922,15 +941,13 @@ ModelInferHandler::Execute(InferHandler::State* state)
   // COMPLETE or CANCELLED. Recording the state and the irequest
   // to handle gRPC stream cancellation.
   if (err == nullptr) {
-    state->context_->InsertInflightState(state, irequest);
+    state->context_->InsertInflightState(state);
+    // The payload will be cleaned in request release callback.
+    request_release_payload.release();
   } else {
     // If error go immediately to COMPLETE.
     LOG_VERBOSE(1) << "[request id: " << request_id << "] "
                    << "Infer failed: " << TRITONSERVER_ErrorMessage(err);
-
-    LOG_TRITONSERVER_ERROR(
-        TRITONSERVER_InferenceRequestDelete(irequest),
-        "deleting GRPC inference request");
 
     ::grpc::Status status;
     GrpcStatusUtil::Create(&status, err);
@@ -961,24 +978,19 @@ ModelInferHandler::InferResponseComplete(
   // notification.
   std::lock_guard<std::recursive_mutex> lock(state->step_mtx_);
 
-  // Increment the callback index
-  state->cb_count_++;
+  // Increment the callback index if received valid 'iresponse'
+  if (iresponse != nullptr) {
+    state->cb_count_++;
+  }
 
   LOG_VERBOSE(1) << "ModelInferHandler::InferResponseComplete, "
                  << state->unique_id_ << " step " << state->step_;
 
-  // Defer to the callback with the final response
-  if ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) == 0) {
-    LOG_ERROR << "[INTERNAL] ModelInfer received a response without FINAL flag";
-    return;
+  // Allow sending 1 response and final flag separately, only mark
+  // non-inflight when seeing final flag
+  if (flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) {
+    state->context_->EraseInflightState(state);
   }
-
-  state->context_->EraseInflightState(state);
-
-#ifdef TRITON_ENABLE_TRACING
-  state->trace_timestamps_.emplace_back(std::make_pair(
-      "INFER_RESPONSE_COMPLETE", TraceManager::CaptureTimestamp()));
-#endif  // TRITON_ENABLE_TRACING
 
   // If gRPC Stream is cancelled then no need of forming and returning
   // a response.
@@ -988,6 +1000,7 @@ ModelInferHandler::InferResponseComplete(
         TRITONSERVER_InferenceResponseDelete(iresponse),
         "deleting GRPC inference response");
 
+    state->context_->EraseInflightState(state);
     state->step_ = Steps::CANCELLED;
 
     LOG_VERBOSE(1) << "ModelInferHandler::InferResponseComplete, "
@@ -1024,25 +1037,32 @@ ModelInferHandler::InferResponseComplete(
                                          "expected a single response, got " +
                                          std::to_string(state->cb_count_))
                                          .c_str());
-  } else if (iresponse == nullptr) {
-    err = TRITONSERVER_ErrorNew(
-        TRITONSERVER_ERROR_INTERNAL, "received an unexpected null response");
-  } else {
+  } else if (iresponse != nullptr) {
     err = InferResponseCompleteCommon<inference::ModelInferResponse>(
         state->tritonserver_, iresponse, *response, state->alloc_payload_);
+#ifdef TRITON_ENABLE_TRACING
+    state->trace_timestamps_.emplace_back(std::make_pair(
+        "INFER_RESPONSE_COMPLETE", TraceManager::CaptureTimestamp()));
+#endif  // TRITON_ENABLE_TRACING
   }
 
   if (err != nullptr) {
     response->Clear();
   }
 
-  ::grpc::Status status;
-  GrpcStatusUtil::Create(&status, err);
+  GrpcStatusUtil::Create(&state->status_, err);
   TRITONSERVER_ErrorDelete(err);
 
   LOG_TRITONSERVER_ERROR(
       TRITONSERVER_InferenceResponseDelete(iresponse),
       "deleting GRPC inference response");
+
+  // Defer sending the response until FINAL flag is seen or
+  // there is error
+  if ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) == 0) {
+    return;
+  }
+
 
 #ifdef TRITON_ENABLE_TRACING
   state->trace_timestamps_.emplace_back(
@@ -1050,7 +1070,7 @@ ModelInferHandler::InferResponseComplete(
 #endif  // TRITON_ENABLE_TRACING
 
   state->step_ = COMPLETE;
-  state->context_->responder_->Finish(*response, status, state);
+  state->context_->responder_->Finish(*response, state->status_, state);
   if (response_created) {
     delete response;
   }

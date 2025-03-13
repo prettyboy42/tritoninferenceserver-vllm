@@ -1,4 +1,4 @@
-// Copyright 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -118,6 +118,15 @@ StringTo(const std::string& arg)
 {
   return std::stoi(arg);
 }
+
+#ifdef TRITON_ENABLE_TRACING
+template <>
+uint32_t
+StringTo(const std::string& arg)
+{
+  return std::stoul(arg);
+}
+#endif  // TRITON_ENABLE_TRACING
 
 template <>
 uint64_t
@@ -246,7 +255,6 @@ ParsePairOption(const std::string& arg, const std::string& delim_str)
   return {ParseOption<T1>(first_string), ParseOption<T2>(second_string)};
 }
 
-#ifdef TRITON_ENABLE_GRPC
 // Split 'options' by 'delim_str' and place split strings into a vector
 std::vector<std::string>
 SplitOptions(std::string options, const std::string& delim_str)
@@ -263,7 +271,6 @@ SplitOptions(std::string options, const std::string& delim_str)
   res.emplace_back(options);
   return res;
 }
-#endif  // TRITON_ENABLE_GRPC
 
 }  // namespace
 
@@ -290,6 +297,7 @@ enum TritonOptionId {
   OPTION_REUSE_HTTP_PORT,
   OPTION_HTTP_ADDRESS,
   OPTION_HTTP_THREAD_COUNT,
+  OPTION_HTTP_RESTRICTED_API,
 #endif  // TRITON_ENABLE_HTTP
 #if defined(TRITON_ENABLE_GRPC)
   OPTION_ALLOW_GRPC,
@@ -311,6 +319,8 @@ enum TritonOptionId {
   OPTION_GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS,
   OPTION_GRPC_ARG_HTTP2_MAX_PING_STRIKES,
   OPTION_GRPC_RESTRICTED_PROTOCOL,
+  OPTION_GRPC_ARG_MAX_CONNECTION_AGE_MS,
+  OPTION_GRPC_ARG_MAX_CONNECTION_AGE_GRACE_MS,
 #endif  // TRITON_ENABLE_GRPC
 #if defined(TRITON_ENABLE_SAGEMAKER)
   OPTION_ALLOW_SAGEMAKER,
@@ -344,10 +354,12 @@ enum TritonOptionId {
   OPTION_MODEL_CONTROL_MODE,
   OPTION_POLL_REPO_SECS,
   OPTION_STARTUP_MODEL,
+  OPTION_CUSTOM_MODEL_CONFIG_NAME,
   OPTION_RATE_LIMIT,
   OPTION_RATE_LIMIT_RESOURCE,
   OPTION_PINNED_MEMORY_POOL_BYTE_SIZE,
   OPTION_CUDA_MEMORY_POOL_BYTE_SIZE,
+  OPTION_CUDA_VIRTUAL_ADDRESS_SIZE,
   OPTION_RESPONSE_CACHE_BYTE_SIZE,
   OPTION_CACHE_CONFIG,
   OPTION_CACHE_DIR,
@@ -357,6 +369,7 @@ enum TritonOptionId {
   OPTION_REPOAGENT_DIR,
   OPTION_BUFFER_MANAGER_THREAD_COUNT,
   OPTION_MODEL_LOAD_THREAD_COUNT,
+  OPTION_MODEL_LOAD_RETRY_COUNT,
   OPTION_BACKEND_CONFIG,
   OPTION_HOST_POLICY,
   OPTION_MODEL_LOAD_GPU_LIMIT,
@@ -429,10 +442,21 @@ TritonParser::SetupOptions()
        "argument will result in error. Note that this option will only take "
        "effect if --model-control-mode=explicit is true."});
   model_repo_options_.push_back(
+      {OPTION_CUSTOM_MODEL_CONFIG_NAME, "model-config-name", Option::ArgStr,
+       "The custom configuration name for models to load."
+       "The name should not contain any space character."
+       "For example: --model-config-name=h100. "
+       "If --model-config-name is not set, Triton will use the default "
+       "config.pbtxt."});
+  model_repo_options_.push_back(
       {OPTION_MODEL_LOAD_THREAD_COUNT, "model-load-thread-count",
        Option::ArgInt,
        "The number of threads used to concurrently load models in "
        "model repositories. Default is 4."});
+  model_repo_options_.push_back(
+      {OPTION_MODEL_LOAD_RETRY_COUNT, "model-load-retry-count", Option::ArgInt,
+       "The number of retry to load a model in "
+       "model repositories. Default is 0."});
   model_repo_options_.push_back(
       {OPTION_MODEL_NAMESPACING, "model-namespacing", Option::ArgBool,
        "Whether model namespacing is enable or not. If true, models with the "
@@ -463,6 +487,16 @@ TritonParser::SetupOptions()
   http_options_.push_back(
       {OPTION_HTTP_THREAD_COUNT, "http-thread-count", Option::ArgInt,
        "Number of threads handling HTTP requests."});
+  http_options_.push_back(
+      {OPTION_HTTP_RESTRICTED_API, "http-restricted-api",
+       "<string>:<string>=<string>",
+       "Specify restricted HTTP api setting. The format of this "
+       "flag is --http-restricted-api=<apis>,<key>=<value>. Where "
+       "<api> is a comma-separated list of apis to be restricted. "
+       "<key> will be additional header key to be checked when a HTTP request "
+       "is received, and <value> is the value expected to be matched."
+       " Allowed APIs: " +
+           Join(RESTRICTED_CATEGORY_NAMES, ", ")});
 #endif  // TRITON_ENABLE_HTTP
 
 #if defined(TRITON_ENABLE_GRPC)
@@ -559,13 +593,25 @@ TritonParser::SetupOptions()
        "sending an HTTP2 GOAWAY frame and closing the transport. Setting it to "
        "0 allows the server to accept any number of bad pings. Default is 2."});
   grpc_options_.push_back(
+      {OPTION_GRPC_ARG_MAX_CONNECTION_AGE_MS, "grpc-max-connection-age",
+       Option::ArgInt,
+       "Maximum time that a channel may exist in milliseconds."
+       "Default is undefined."});
+  grpc_options_.push_back(
+      {OPTION_GRPC_ARG_MAX_CONNECTION_AGE_GRACE_MS,
+       "grpc-max-connection-age-grace", Option::ArgInt,
+       "Grace period after the channel reaches its max age. "
+       "Default is undefined."});
+  grpc_options_.push_back(
       {OPTION_GRPC_RESTRICTED_PROTOCOL, "grpc-restricted-protocol",
        "<string>:<string>=<string>",
        "Specify restricted GRPC protocol setting. The format of this "
        "flag is --grpc-restricted-protocol=<protocols>,<key>=<value>. Where "
        "<protocol> is a comma-separated list of protocols to be restricted. "
        "<key> will be additional header key to be checked when a GRPC request "
-       "is received, and <value> is the value expected to be matched."});
+       "is received, and <value> is the value expected to be matched."
+       " Allowed protocols: " +
+           Join(RESTRICTED_CATEGORY_NAMES, ", ")});
 #endif  // TRITON_ENABLE_GRPC
 
 #ifdef TRITON_ENABLE_LOGGING
@@ -740,6 +786,18 @@ TritonParser::SetupOptions()
        "<GPU device ID>:<pool byte size>. This option can be used multiple "
        "times, but only once per GPU device. Subsequent uses will overwrite "
        "previous uses for the same GPU device. Default is 64 MB."});
+  memory_device_options_.push_back(
+      {OPTION_CUDA_VIRTUAL_ADDRESS_SIZE, "cuda-virtual-address-size",
+       "<integer>:<integer>",
+       "The total CUDA virtual address size that will be used for each "
+       "implicit state when growable memory is used. This value determines "
+       "the maximum size of each implicit state. The state size cannot go "
+       "beyond this value. The argument should be "
+       "2 integers separated by colons in the format "
+       "<GPU device ID>:<CUDA virtual address size>. This option can be used "
+       "multiple "
+       "times, but only once per GPU device. Subsequent uses will overwrite "
+       "previous uses for the same GPU device. Default is 1 GB."});
   memory_device_options_.push_back(
       {OPTION_MIN_SUPPORTED_COMPUTE_CAPABILITY,
        "min-supported-compute-capability", Option::ArgFloat,
@@ -963,6 +1021,11 @@ TritonServerParameters::BuildTritonServerOptions()
   }
   THROW_IF_ERR(
       ParseException,
+      TRITONSERVER_ServerOptionsSetModelConfigName(
+          loptions, model_config_name_.c_str()),
+      "setting custom model configuration name for models");
+  THROW_IF_ERR(
+      ParseException,
       TRITONSERVER_ServerOptionsSetRateLimiterMode(loptions, rate_limit_mode_),
       "setting rate limiter configuration");
   for (const auto& resource : rate_limit_resources_) {
@@ -984,6 +1047,14 @@ TritonServerParameters::BuildTritonServerOptions()
         TRITONSERVER_ServerOptionsSetCudaMemoryPoolByteSize(
             loptions, cuda_pool.first, cuda_pool.second),
         "setting total CUDA memory byte size");
+  }
+  for (const auto& cuda_virtual_address_size : cuda_virtual_address_size_) {
+    THROW_IF_ERR(
+        ParseException,
+        TRITONSERVER_ServerOptionsSetCudaVirtualAddressSize(
+            loptions, cuda_virtual_address_size.first,
+            cuda_virtual_address_size.second),
+        "setting total CUDA virtual address size");
   }
   THROW_IF_ERR(
       ParseException,
@@ -1019,6 +1090,11 @@ TritonServerParameters::BuildTritonServerOptions()
       TRITONSERVER_ServerOptionsSetModelLoadThreadCount(
           loptions, std::max(1u, model_load_thread_count_)),
       "setting model load thread count");
+  THROW_IF_ERR(
+      ParseException,
+      TRITONSERVER_ServerOptionsSetModelLoadRetryCount(
+          loptions, std::max(0u, model_load_retry_count_)),
+      "setting model load retry count");
   THROW_IF_ERR(
       ParseException,
       TRITONSERVER_ServerOptionsSetModelNamespacing(
@@ -1172,6 +1248,11 @@ TritonParser::Parse(int argc, char** argv)
   triton::server::grpc::Options& lgrpc_options = lparams.grpc_options_;
 #endif  // TRITON_ENABLE_GRPC
 
+#if defined TRITON_ENABLE_HTTP || defined TRITON_ENABLE_GRPC
+  // According to HTTP specification header names are case-insensitive.
+  const std::string case_insensitive_prefix{"(?i)"};
+#endif  // TRITON_ENABLE_HTTP || TRITON_ENABLE_GRPC
+
 #ifdef TRITON_ENABLE_VERTEX_AI
   // Set different default value if specific flag is set
   {
@@ -1276,18 +1357,24 @@ TritonParser::Parse(int argc, char** argv)
           lparams.http_port_ = ParseOption<int>(optarg);
           break;
         case OPTION_REUSE_HTTP_PORT:
-          lparams.reuse_http_port_ = ParseOption<int>(optarg);
+          lparams.reuse_http_port_ = ParseOption<bool>(optarg);
           break;
         case OPTION_HTTP_ADDRESS:
           lparams.http_address_ = optarg;
           break;
         case OPTION_HTTP_HEADER_FORWARD_PATTERN:
-          lparams.http_forward_header_pattern_ = optarg;
-          break;
+          lparams.http_forward_header_pattern_ =
+              std::move(case_insensitive_prefix + optarg);
           break;
         case OPTION_HTTP_THREAD_COUNT:
           lparams.http_thread_cnt_ = ParseOption<int>(optarg);
           break;
+        case OPTION_HTTP_RESTRICTED_API:
+          ParseRestrictedFeatureOption(
+              optarg, long_options[option_index].name, "", "api",
+              lparams.http_restricted_apis_);
+          break;
+
 #endif  // TRITON_ENABLE_HTTP
 
 #ifdef TRITON_ENABLE_SAGEMAKER
@@ -1330,7 +1417,7 @@ TritonParser::Parse(int argc, char** argv)
           lgrpc_options.socket_.port_ = ParseOption<int>(optarg);
           break;
         case OPTION_REUSE_GRPC_PORT:
-          lgrpc_options.socket_.reuse_port_ = ParseOption<int>(optarg);
+          lgrpc_options.socket_.reuse_port_ = ParseOption<bool>(optarg);
           break;
         case OPTION_GRPC_ADDRESS:
           lgrpc_options.socket_.address_ = optarg;
@@ -1368,7 +1455,8 @@ TritonParser::Parse(int argc, char** argv)
             lgrpc_options.infer_compression_level_ = GRPC_COMPRESS_LEVEL_HIGH;
           } else {
             throw ParseException(
-                "invalid argument for --grpc_infer_response_compression_level");
+                "invalid argument for "
+                "--grpc_infer_response_compression_level");
           }
           break;
         }
@@ -1397,21 +1485,25 @@ TritonParser::Parse(int argc, char** argv)
           lgrpc_options.keep_alive_.http2_max_ping_strikes_ =
               ParseOption<int>(optarg);
           break;
+        case OPTION_GRPC_ARG_MAX_CONNECTION_AGE_MS:
+          lgrpc_options.keep_alive_.max_connection_age_ms_ =
+              ParseOption<int>(optarg);
+          break;
+        case OPTION_GRPC_ARG_MAX_CONNECTION_AGE_GRACE_MS:
+          lgrpc_options.keep_alive_.max_connection_age_grace_ms_ =
+              ParseOption<int>(optarg);
+          break;
         case OPTION_GRPC_RESTRICTED_PROTOCOL: {
-          const auto& parsed_tuple = ParseGrpcRestrictedProtocolOption(optarg);
-          const auto& protocols = SplitOptions(std::get<0>(parsed_tuple), ",");
-          const auto& key = std::get<1>(parsed_tuple);
-          const auto& value = std::get<2>(parsed_tuple);
-          grpc::ProtocolGroup pg;
-          for (const auto& p : protocols) {
-            pg.protocols_.emplace(p);
-          }
-          pg.restricted_key_ = std::make_pair(key, value);
-          lgrpc_options.protocol_groups_.emplace_back(pg);
+          ParseRestrictedFeatureOption(
+              optarg, long_options[option_index].name,
+              std::string(
+                  triton::server::grpc::kRestrictedProtocolHeaderTemplate),
+              "protocol", lgrpc_options.restricted_protocols_);
           break;
         }
         case OPTION_GRPC_HEADER_FORWARD_PATTERN:
-          lgrpc_options.forward_header_pattern_ = optarg;
+          lgrpc_options.forward_header_pattern_ =
+              std::move(case_insensitive_prefix + optarg);
           break;
 #endif  // TRITON_ENABLE_GRPC
 
@@ -1511,6 +1603,13 @@ TritonParser::Parse(int argc, char** argv)
         case OPTION_STARTUP_MODEL:
           lparams.startup_models_.insert(optarg);
           break;
+        case OPTION_CUSTOM_MODEL_CONFIG_NAME:
+          if (std::strlen(optarg) == 0) {
+            throw ParseException(
+                "Error: empty argument for --model-config-name");
+          }
+          lparams.model_config_name_ = optarg;
+          break;
         case OPTION_MODEL_CONTROL_MODE: {
           std::string mode_str(optarg);
           std::transform(
@@ -1555,6 +1654,10 @@ TritonParser::Parse(int argc, char** argv)
         case OPTION_CUDA_MEMORY_POOL_BYTE_SIZE:
           lparams.cuda_pools_.push_back(
               ParsePairOption<int, uint64_t>(optarg, ":"));
+          break;
+        case OPTION_CUDA_VIRTUAL_ADDRESS_SIZE:
+          lparams.cuda_virtual_address_size_.push_back(
+              ParsePairOption<int, size_t>(optarg, ":"));
           break;
         case OPTION_RESPONSE_CACHE_BYTE_SIZE: {
           cache_size_present = true;
@@ -1601,6 +1704,9 @@ TritonParser::Parse(int argc, char** argv)
           break;
         case OPTION_MODEL_LOAD_THREAD_COUNT:
           lparams.model_load_thread_count_ = ParseOption<int>(optarg);
+          break;
+        case OPTION_MODEL_LOAD_RETRY_COUNT:
+          lparams.model_load_retry_count_ = ParseOption<int>(optarg);
           break;
         case OPTION_BACKEND_CONFIG:
           lparams.backend_config_settings_.push_back(
@@ -1759,7 +1865,8 @@ TritonParser::ParseMetricsConfigOption(const std::string& arg)
   int delim_name = name_substr.find(",");
 
   // No name-specific configs currently supported, though it may be in
-  // the future. Map global configs to empty string like other configs for now.
+  // the future. Map global configs to empty string like other configs for
+  // now.
   std::string name_string = std::string();
   if (delim_name >= 0) {
     std::stringstream ss;
@@ -1830,7 +1937,8 @@ TritonParser::ParseRateLimiterResourceOption(const std::string& arg)
 {
   std::string error_string(
       "--rate-limit-resource option format is "
-      "'<resource_name>:<count>:<device>' or '<resource_name>:<count>'. Got " +
+      "'<resource_name>:<count>:<device>' or '<resource_name>:<count>'. "
+      "Got " +
       arg);
 
   std::string name_string("");
@@ -1904,57 +2012,64 @@ TritonParser::ParseBackendConfigOption(const std::string& arg)
   return {name_string, setting_string, value_string};
 }
 
-std::tuple<std::string, std::string, std::string>
-TritonParser::ParseGrpcRestrictedProtocolOption(const std::string& arg)
+void
+TritonParser::ParseRestrictedFeatureOption(
+    const std::string& arg, const std::string& option_name,
+    const std::string& key_prefix, const std::string& feature_type,
+    RestrictedFeatures& restricted_features)
 {
-  try {
-    return ParseGenericConfigOption(arg, ":", "=");
+  const auto& parsed_tuple =
+      ParseGenericConfigOption(arg, ":", "=", option_name, "config name");
+
+  const auto& features = SplitOptions(std::get<0>(parsed_tuple), ",");
+  const auto& key = std::get<1>(parsed_tuple);
+  const auto& value = std::get<2>(parsed_tuple);
+
+  for (const auto& feature : features) {
+    const auto& category = RestrictedFeatures::ToCategory(feature);
+
+    if (category == RestrictedCategory::INVALID) {
+      std::stringstream ss;
+      ss << "unknown restricted " << feature_type << " '" << feature << "' "
+         << std::endl;
+      throw ParseException(ss.str());
+    }
+
+    if (restricted_features.IsRestricted(category)) {
+      // restricted feature can only be in one group
+      std::stringstream ss;
+      ss << "restricted " << feature_type << " '" << feature
+         << "' can not be specified in multiple config groups" << std::endl;
+      throw ParseException(ss.str());
+    }
+    restricted_features.Insert(
+        category, std::make_pair(key_prefix + key, value));
   }
-  catch (const ParseException& pe) {
-    // catch and throw exception with option specific message
-    std::stringstream ss;
-    ss << "--grpc-restricted-protocol option format is '<config "
-          "name>:<setting>=<value>'. Got "
-       << arg << std::endl;
-    throw ParseException(ss.str());
-  }
-  // Should not reach here
-  return {};
 }
 
 std::tuple<std::string, std::string, std::string>
 TritonParser::ParseHostPolicyOption(const std::string& arg)
 {
-  try {
-    return ParseGenericConfigOption(arg, ",", "=");
-  }
-  catch (const ParseException& pe) {
-    // catch and throw exception with option specific message
-    std::stringstream ss;
-    ss << "--host-policy option format is '<policy "
-          "name>,<setting>=<value>'. Got "
-       << arg << std::endl;
-    throw ParseException(ss.str());
-  }
-  // Should not reach here
-  return {};
+  return ParseGenericConfigOption(arg, ",", "=", "host-policy", "policy name");
 }
 
 std::tuple<std::string, std::string, std::string>
 TritonParser::ParseGenericConfigOption(
     const std::string& arg, const std::string& first_delim,
-    const std::string& second_delim)
+    const std::string& second_delim, const std::string& option_name,
+    const std::string& config_name)
 {
   // Format is "<string>,<string>=<string>"
   int delim_name = arg.find(first_delim);
   int delim_setting = arg.find(second_delim, delim_name + 1);
 
+  std::string error_string = "--" + option_name + " option format is '<" +
+                             config_name + ">" + first_delim + "<setting>" +
+                             second_delim + "<value>'. Got " + arg + "\n";
+
   // Check for 2 semicolons
   if ((delim_name < 0) || (delim_setting < 0)) {
-    std::stringstream ss;
-    ss << "option format is '<string>" << first_delim << "<string>"
-       << second_delim << "<string>'. Got " << arg << std::endl;
-    throw ParseException(ss.str());
+    throw ParseException(error_string);
   }
 
   std::string name_string = arg.substr(0, delim_name);
@@ -1963,10 +2078,7 @@ TritonParser::ParseGenericConfigOption(
   std::string value_string = arg.substr(delim_setting + 1);
 
   if (name_string.empty() || setting_string.empty() || value_string.empty()) {
-    std::stringstream ss;
-    ss << "option format is '<string>" << first_delim << "<string>"
-       << second_delim << "<string>'. Got " << arg << std::endl;
-    throw ParseException(ss.str());
+    throw ParseException(error_string);
   }
 
   return {name_string, setting_string, value_string};
@@ -2059,43 +2171,44 @@ TritonParser::SetGlobalTraceArgs(
     bool trace_rate_present, bool trace_count_present,
     bool explicit_disable_trace)
 {
-  for (const auto& global_setting : lparams.trace_config_map_[""]) {
+  for (const auto& [setting, value_variant] : lparams.trace_config_map_[""]) {
+    auto value = std::get<std::string>(value_variant);
     try {
-      if (global_setting.first == "rate") {
+      if (setting == "rate") {
         if (trace_rate_present) {
           std::cerr << "Warning: Overriding deprecated '--trace-rate' "
                        "in favor of provided rate value in --trace-config!"
                     << std::endl;
         }
-        lparams.trace_rate_ = ParseOption<int>(global_setting.second);
+        lparams.trace_rate_ = ParseOption<int>(value);
       }
-      if (global_setting.first == "level") {
+      if (setting == "level") {
         if (trace_level_present) {
           std::cerr << "Warning: Overriding deprecated '--trace-level' "
                        "in favor of provided level in --trace-config!"
                     << std::endl;
         }
-        auto parsed_level_config = ParseTraceLevelOption(global_setting.second);
+        auto parsed_level_config = ParseTraceLevelOption(value);
         explicit_disable_trace |=
             (parsed_level_config == TRITONSERVER_TRACE_LEVEL_DISABLED);
         lparams.trace_level_ = static_cast<TRITONSERVER_InferenceTraceLevel>(
             lparams.trace_level_ | parsed_level_config);
       }
-      if (global_setting.first == "mode") {
-        lparams.trace_mode_ = ParseTraceModeOption(global_setting.second);
+      if (setting == "mode") {
+        lparams.trace_mode_ = ParseTraceModeOption(value);
       }
-      if (global_setting.first == "count") {
+      if (setting == "count") {
         if (trace_count_present) {
           std::cerr << "Warning: Overriding deprecated '--trace-count' "
                        "in favor of provided count in --trace-config!"
                     << std::endl;
         }
-        lparams.trace_count_ = ParseOption<int>(global_setting.second);
+        lparams.trace_count_ = ParseOption<int>(value);
       }
     }
     catch (const ParseException& pe) {
       std::stringstream ss;
-      ss << "Bad option: \"--trace-config " << global_setting.first << "\".\n"
+      ss << "Bad option: \"--trace-config " << setting << "\".\n"
          << pe.what() << std::endl;
       throw ParseException(ss.str());
     }
@@ -2107,29 +2220,29 @@ TritonParser::SetTritonTraceArgs(
     TritonServerParameters& lparams, bool trace_filepath_present,
     bool trace_log_frequency_present)
 {
-  for (const auto& mode_setting :
+  for (const auto& [setting, value_variant] :
        lparams.trace_config_map_[std::to_string(TRACE_MODE_TRITON)]) {
+    auto value = std::get<std::string>(value_variant);
     try {
-      if (mode_setting.first == "file") {
+      if (setting == "file") {
         if (trace_filepath_present) {
           std::cerr << "Warning: Overriding deprecated '--trace-file' "
                        "in favor of provided file in --trace-config!"
                     << std::endl;
         }
-        lparams.trace_filepath_ = mode_setting.second;
-      } else if (mode_setting.first == "log-frequency") {
+        lparams.trace_filepath_ = value;
+      } else if (setting == "log-frequency") {
         if (trace_log_frequency_present) {
-          std::cerr << "Warning: Overriding deprecated '--trace-file' "
-                       "in favor of provided file in --trace-config!"
+          std::cerr << "Warning: Overriding deprecated '--trace-log-frequency' "
+                       "in favor of provided log-frequency in --trace-config!"
                     << std::endl;
         }
-        lparams.trace_log_frequency_ = ParseOption<int>(mode_setting.second);
+        lparams.trace_log_frequency_ = ParseOption<int>(value);
       }
     }
     catch (const ParseException& pe) {
       std::stringstream ss;
-      ss << "Bad option: \"--trace-config triton," << mode_setting.first
-         << "\".\n"
+      ss << "Bad option: \"--trace-config triton," << setting << "\".\n"
          << pe.what() << std::endl;
       throw ParseException(ss.str());
     }
@@ -2137,8 +2250,9 @@ TritonParser::SetTritonTraceArgs(
 }
 
 void
-TritonParser::VerifyOpentelemetryTraceArgs(
-    bool trace_filepath_present, bool trace_log_frequency_present)
+TritonParser::SetOpenTelemetryTraceArgs(
+    TritonServerParameters& lparams, bool trace_filepath_present,
+    bool trace_log_frequency_present)
 {
   if (trace_filepath_present) {
     std::cerr << "Warning: '--trace-file' is deprecated and will "
@@ -2149,6 +2263,74 @@ TritonParser::VerifyOpentelemetryTraceArgs(
     std::cerr << "Warning: '--trace-log-frequency' is deprecated "
                  "and will be ignored with opentelemetry tracing mode."
               << std::endl;
+  }
+  triton::server::TraceConfig& otel_trace_settings =
+      lparams.trace_config_map_[std::to_string(TRACE_MODE_OPENTELEMETRY)];
+  ProcessOpenTelemetryBatchSpanProcessorArgs(otel_trace_settings);
+}
+
+void
+TritonParser::ProcessOpenTelemetryBatchSpanProcessorArgs(
+    TraceConfig& otel_trace_settings)
+{
+  std::unordered_map<std::string, std::string> otel_bsp_default_settings = {};
+  // Set up default BatchSpanProcessor parameters, or use
+  // parameters, specified by environment variables
+  auto env_bsp_max_queue_size = triton::server::GetEnvironmentVariableOrDefault(
+      "OTEL_BSP_MAX_QUEUE_SIZE", "2048");
+  otel_bsp_default_settings.insert(std::make_pair(
+      std::string("bsp_max_queue_size"), env_bsp_max_queue_size));
+  auto env_bsp_schedule_delay = triton::server::GetEnvironmentVariableOrDefault(
+      "OTEL_BSP_SCHEDULE_DELAY", "5000");
+  otel_bsp_default_settings.insert(std::make_pair(
+      std::string("bsp_schedule_delay"), env_bsp_schedule_delay));
+  auto env_bsp_max_export_batch_size =
+      triton::server::GetEnvironmentVariableOrDefault(
+          "OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "512");
+  otel_bsp_default_settings.insert(std::make_pair(
+      std::string("bsp_max_export_batch_size"), env_bsp_max_export_batch_size));
+
+  // Process cmd args and convert string arguments to integers.
+  // Throw a ParseException for invalid arguments
+  for (auto& [setting, value_variant] : otel_trace_settings) {
+    try {
+      auto value = std::get<std::string>(value_variant);
+      if (setting == "bsp_max_queue_size") {
+        value_variant = ParseOption<uint32_t>(value);
+        otel_bsp_default_settings.erase("bsp_max_queue_size");
+      } else if (setting == "bsp_schedule_delay") {
+        value_variant = ParseOption<uint32_t>(value);
+        otel_bsp_default_settings.erase("bsp_schedule_delay");
+      } else if (setting == "bsp_max_export_batch_size") {
+        value_variant = ParseOption<uint32_t>(value);
+        otel_bsp_default_settings.erase("bsp_max_export_batch_size");
+      }
+    }
+    catch (const ParseException& pe) {
+      std::stringstream ss;
+      ss << "Bad option: \"--trace-config opentelemetry," << setting << "\".\n"
+         << pe.what() << std::endl;
+      throw ParseException(ss.str());
+    }
+  }
+  // If not all BSP settings were provided through cmd,
+  // populate OpenTelemetry's trace settings with the default value.
+  if (!otel_bsp_default_settings.empty()) {
+    for (const auto& [setting, value] : otel_bsp_default_settings) {
+      try {
+        otel_trace_settings.push_back(
+            std::make_pair(setting, ParseOption<uint32_t>(value)));
+      }
+      catch (const ParseException& pe) {
+        std::stringstream ss;
+        ss << "Bad option: \"OTEL_";
+        for (auto& ch : setting) {
+          ss << static_cast<char>(std::toupper(ch));
+        }
+        ss << "\".\n" << pe.what() << std::endl;
+        throw ParseException(ss.str());
+      }
+    }
   }
 }
 
@@ -2164,8 +2346,8 @@ TritonParser::PostProcessTraceArgs(
       explicit_disable_trace);
 
   if (lparams.trace_mode_ == TRACE_MODE_OPENTELEMETRY) {
-    VerifyOpentelemetryTraceArgs(
-        trace_filepath_present, trace_log_frequency_present);
+    SetOpenTelemetryTraceArgs(
+        lparams, trace_filepath_present, trace_log_frequency_present);
   } else if (lparams.trace_mode_ == TRACE_MODE_TRITON) {
     SetTritonTraceArgs(
         lparams, trace_filepath_present, trace_log_frequency_present);
@@ -2177,5 +2359,4 @@ TritonParser::PostProcessTraceArgs(
 }
 
 #endif  // TRITON_ENABLE_TRACING
-
-}}  // namespace triton::server
+}}      // namespace triton::server

@@ -1,4 +1,4 @@
-// Copyright 2020-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2020-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -31,6 +31,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <string>
 #include <thread>
@@ -38,6 +39,7 @@
 
 #include "common.h"
 #include "data_compressor.h"
+#include "restricted_features.h"
 #include "shared_memory_manager.h"
 #include "tracer.h"
 #include "triton/common/logging.h"
@@ -79,7 +81,9 @@ class HTTPServer {
   virtual ~HTTPServer() { IGNORE_ERR(Stop()); }
 
   TRITONSERVER_Error* Start();
-  TRITONSERVER_Error* Stop();
+  TRITONSERVER_Error* Stop(
+      uint32_t* exit_timeout_secs = nullptr,
+      const std::string& service_name = "HTTP");
 
  protected:
   explicit HTTPServer(
@@ -87,7 +91,8 @@ class HTTPServer {
       const std::string& header_forward_pattern, const int thread_cnt)
       : port_(port), reuse_port_(reuse_port), address_(address),
         header_forward_pattern_(header_forward_pattern),
-        thread_cnt_(thread_cnt), header_forward_regex_(header_forward_pattern_)
+        thread_cnt_(thread_cnt), header_forward_regex_(header_forward_pattern_),
+        conn_cnt_(0), accepting_new_conn_(true)
   {
   }
 
@@ -98,6 +103,9 @@ class HTTPServer {
   virtual void Handle(evhtp_request_t* req) = 0;
 
   static void StopCallback(evutil_socket_t sock, short events, void* arg);
+
+  static evhtp_res NewConnection(evhtp_connection_t* conn, void* arg);
+  static evhtp_res EndConnection(evhtp_connection_t* conn, void* arg);
 
   int32_t port_;
   bool reuse_port_;
@@ -111,6 +119,10 @@ class HTTPServer {
   std::thread worker_;
   evutil_socket_t fds_[2];
   event* break_ev_;
+
+  std::mutex conn_mu_;
+  uint32_t conn_cnt_;
+  bool accepting_new_conn_;
 };
 
 #ifdef TRITON_ENABLE_METRICS
@@ -141,6 +153,36 @@ class HTTPMetricsServer : public HTTPServer {
 };
 #endif  // TRITON_ENABLE_METRICS
 
+#if !defined(_WIN32) && defined(TRITON_ENABLE_TRACING)
+class HttpTextMapCarrier : public otel_cntxt::propagation::TextMapCarrier {
+ public:
+  HttpTextMapCarrier(evhtp_kvs_t* headers) : headers_(headers) {}
+  HttpTextMapCarrier() = default;
+  virtual opentelemetry::nostd::string_view Get(
+      opentelemetry::nostd::string_view key) const noexcept override
+  {
+    std::string key_to_compare = key.data();
+    auto it = evhtp_kv_find(headers_, key_to_compare.c_str());
+    if (it != NULL) {
+      return opentelemetry::nostd::string_view(it);
+    }
+    return "";
+  }
+  // Not required on server side
+  virtual void Set(
+      opentelemetry::nostd::string_view key,
+      opentelemetry::nostd::string_view value) noexcept override
+  {
+    return;
+  }
+
+  evhtp_kvs_t* headers_;
+};
+#else
+using HttpTextMapCarrier = void*;
+#endif
+
+
 // HTTP API server that implements KFServing community standard inference
 // protocols and extensions used by Triton.
 class HTTPAPIServer : public HTTPServer {
@@ -151,6 +193,7 @@ class HTTPAPIServer : public HTTPServer {
       const std::shared_ptr<SharedMemoryManager>& smb_manager,
       const int32_t port, const bool reuse_port, const std::string& address,
       const std::string& header_forward_pattern, const int thread_cnt,
+      const RestrictedFeatures& restricted_apis,
       std::unique_ptr<HTTPServer>* http_server);
 
   virtual ~HTTPAPIServer();
@@ -220,8 +263,15 @@ class HTTPAPIServer : public HTTPServer {
     // buffer in HTTPServer code.
     explicit InferRequestClass(
         TRITONSERVER_Server* server, evhtp_request_t* req,
-        DataCompressor::Type response_compression_type);
-    virtual ~InferRequestClass() = default;
+        DataCompressor::Type response_compression_type,
+        const std::shared_ptr<TRITONSERVER_InferenceRequest>& triton_request);
+    virtual ~InferRequestClass()
+    {
+      if (req_ != nullptr) {
+        evhtp_request_unset_hook(req_, evhtp_hook_on_request_fini);
+      }
+      req_ = nullptr;
+    }
 
     evhtp_request_t* EvHtpRequest() const { return req_; }
 
@@ -251,15 +301,28 @@ class HTTPAPIServer : public HTTPServer {
     // lifetime of the request.
     std::list<std::vector<char>> serialized_data_;
 
-   protected:
-    TRITONSERVER_Server* server_;
-    evhtp_request_t* req_;
-    evthr_t* thread_;
+    static void ReplyCallback(evthr_t* thr, void* arg, void* shared);
 
-    DataCompressor::Type response_compression_type_;
+   protected:
+    TRITONSERVER_Server* server_{nullptr};
+    evhtp_request_t* req_{nullptr};
+    evthr_t* thread_{nullptr};
+
+    DataCompressor::Type response_compression_type_{
+        DataCompressor::Type::IDENTITY};
 
     // Counter to keep track of number of responses generated.
-    std::atomic<uint32_t> response_count_;
+    std::atomic<uint32_t> response_count_{0};
+
+    // Event hook for called before request deletion
+    static evhtp_res RequestFiniHook(evhtp_request* req, void* arg);
+
+    // Pointer to associated Triton request, this class does not own the
+    // request and must not reference it after a successful
+    // TRITONSERVER_ServerInferAsync (except for cancellation).
+    std::shared_ptr<TRITONSERVER_InferenceRequest> triton_request_{nullptr};
+
+    evhtp_res response_code_{EVHTP_RES_OK};
   };
 
   class GenerateRequestClass : public InferRequestClass {
@@ -269,10 +332,11 @@ class HTTPAPIServer : public HTTPServer {
         DataCompressor::Type response_compression_type,
         const MappingSchema* request_schema,
         const MappingSchema* response_schema, bool streaming,
-        TRITONSERVER_InferenceRequest* triton_request)
-        : InferRequestClass(server, req, response_compression_type),
+        const std::shared_ptr<TRITONSERVER_InferenceRequest>& triton_request)
+        : InferRequestClass(
+              server, req, response_compression_type, triton_request),
           request_schema_(request_schema), response_schema_(response_schema),
-          streaming_(streaming), triton_request_(triton_request)
+          streaming_(streaming)
     {
     }
     virtual ~GenerateRequestClass();
@@ -291,7 +355,7 @@ class HTTPAPIServer : public HTTPServer {
     TRITONSERVER_Error* FinalizeResponse(
         TRITONSERVER_InferenceResponse* response) override;
     void AddErrorJson(TRITONSERVER_Error* error);
-    void StartResponse(evhtp_res code);
+    static void StartResponse(evthr_t* thr, void* arg, void* shared);
 
     // [DLIS-5551] currently always performs basic conversion, only maps schema
     // of EXACT_MAPPING kind. MAPPING_SCHEMA and upcoming kinds are for
@@ -337,10 +401,6 @@ class HTTPAPIServer : public HTTPServer {
     const MappingSchema* request_schema_{nullptr};
     const MappingSchema* response_schema_{nullptr};
     const bool streaming_{false};
-    // Pointer to associated Triton request, this class does not own the
-    // request and must not reference it after a successful
-    // TRITONSERVER_ServerInferAsync.
-    TRITONSERVER_InferenceRequest* triton_request_{nullptr};
     // Placeholder to completing response, this class does not own
     // the response.
     TRITONSERVER_InferenceResponse* triton_response_{nullptr};
@@ -352,20 +412,43 @@ class HTTPAPIServer : public HTTPServer {
     bool end_{false};
   };
 
+  // Simple structure that carries the userp payload needed for
+  // request release callback.
+  struct RequestReleasePayload final {
+    RequestReleasePayload(
+        const std::shared_ptr<TRITONSERVER_InferenceRequest>& inference_request,
+        evbuffer* buffer)
+        : inference_request_(inference_request), buffer_(buffer){};
+
+    ~RequestReleasePayload()
+    {
+      if (buffer_ != nullptr) {
+        evbuffer_free(buffer_);
+      }
+    };
+
+   private:
+    std::shared_ptr<TRITONSERVER_InferenceRequest> inference_request_ = nullptr;
+    evbuffer* buffer_ = nullptr;
+  };
+
  protected:
   explicit HTTPAPIServer(
       const std::shared_ptr<TRITONSERVER_Server>& server,
       triton::server::TraceManager* trace_manager,
       const std::shared_ptr<SharedMemoryManager>& shm_manager,
       const int32_t port, const bool reuse_port, const std::string& address,
-      const std::string& header_forward_pattern, const int thread_cnt);
+      const std::string& header_forward_pattern, const int thread_cnt,
+      const RestrictedFeatures& restricted_apis = {});
+
   virtual void Handle(evhtp_request_t* req) override;
   // [FIXME] extract to "infer" class
   virtual std::unique_ptr<InferRequestClass> CreateInferRequest(
-      evhtp_request_t* req)
+      evhtp_request_t* req,
+      const std::shared_ptr<TRITONSERVER_InferenceRequest>& triton_request)
   {
     return std::unique_ptr<InferRequestClass>(new InferRequestClass(
-        server_.get(), req, GetResponseCompressionType(req)));
+        server_.get(), req, GetResponseCompressionType(req), triton_request));
   }
 
   // Helper function to retrieve infer request header in the form specified by
@@ -491,10 +574,6 @@ class HTTPAPIServer : public HTTPServer {
       triton::common::TritonJson::Value& request_json,
       TRITONSERVER_InferenceRequest* irequest);
 
-
-  static void OKReplyCallback(evthr_t* thr, void* arg, void* shared);
-  static void BADReplyCallback(evthr_t* thr, void* arg, void* shared);
-
   std::shared_ptr<TRITONSERVER_Server> server_;
 
   // Storing server metadata as it is consistent during server running
@@ -543,6 +622,9 @@ class HTTPAPIServer : public HTTPServer {
         parameters_field,
         new MappingSchema(MappingSchema::Kind::MAPPING_SCHEMA, true));
   }
+  RestrictedFeatures restricted_apis_{};
+  bool RespondIfRestricted(
+      evhtp_request_t* req, const Restriction& restriction);
 };
 
 }}  // namespace triton::server

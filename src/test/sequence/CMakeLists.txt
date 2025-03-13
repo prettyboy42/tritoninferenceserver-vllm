@@ -43,7 +43,6 @@ add_library(
   TritonSequenceBackend::triton-sequence-backend ALIAS triton-sequence-backend
 )
 
-
 target_compile_features(triton-sequence-backend PRIVATE cxx_std_11)
 
 if (${TRITON_ENABLE_ROCM})

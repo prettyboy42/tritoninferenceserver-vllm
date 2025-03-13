@@ -32,15 +32,13 @@ apt-get install -y --no-install-recommends \
 
 # Client build requires recent version of CMake (FetchContent required)
 # Using CMAKE installation instruction from:: https://apt.kitware.com/
-apt update && apt install -y gpg wget && \
-    wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | \
-        gpg --dearmor - |  \
-        tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null && \
-    . /etc/os-release && \
-    echo "deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ $UBUNTU_CODENAME main" | \
-    tee /etc/apt/sources.list.d/kitware.list >/dev/null && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends cmake cmake-data
+apt update -q=2 \
+    && apt install -y gpg wget \
+    && wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - |  tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null \
+    && . /etc/os-release \
+    && echo "deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ $UBUNTU_CODENAME main" | tee /etc/apt/sources.list.d/kitware.list >/dev/null \
+    && apt-get update -q=2 \
+    && apt-get install -y --no-install-recommends cmake=3.27.7* cmake-data=3.27.7*
 cmake --version
 
 
@@ -51,6 +49,7 @@ mkdir -p /workspace/build
 #
 # Build without GPU support
 #
+TRITON_REPO_ORGANIZATION=${TRITON_REPO_ORGANIZATION:="http://github.com/triton-inference-server"}
 (cd /workspace/build && \
         rm -fr cc-clients java-clients python-clients && \
         cmake -DCMAKE_INSTALL_PREFIX=/workspace/install \
@@ -65,7 +64,8 @@ mkdir -p /workspace/build
               -DTRITON_ENABLE_PERF_ANALYZER_TS=OFF \
               -DTRITON_ENABLE_EXAMPLES=ON \
               -DTRITON_ENABLE_TESTS=ON \
-              -DTRITON_ENABLE_ROCM=OFF \
+              -DTRITON_ENABLE_GPU=OFF \
+              -DTRITON_REPO_ORGANIZATION:STRING=${TRITON_REPO_ORGANIZATION} \
               -DTRITON_COMMON_REPO_TAG=${TRITON_COMMON_REPO_TAG} \
               -DTRITON_CORE_REPO_TAG=${TRITON_CORE_REPO_TAG} \
               -DTRITON_THIRD_PARTY_REPO_TAG=${TRITON_THIRD_PARTY_REPO_TAG} \
@@ -96,7 +96,8 @@ fi
               -DTRITON_ENABLE_PERF_ANALYZER_TS=OFF \
               -DTRITON_ENABLE_EXAMPLES=ON \
               -DTRITON_ENABLE_TESTS=ON \
-              -DTRITON_ENABLE_ROCM=ON \
+              -DTRITON_ENABLE_GPU=ON \
+              -DTRITON_REPO_ORGANIZATION:STRING=${TRITON_REPO_ORGANIZATION} \
               -DTRITON_COMMON_REPO_TAG=${TRITON_COMMON_REPO_TAG} \
               -DTRITON_CORE_REPO_TAG=${TRITON_CORE_REPO_TAG} \
               -DTRITON_THIRD_PARTY_REPO_TAG=${TRITON_THIRD_PARTY_REPO_TAG} \
@@ -126,7 +127,8 @@ fi
               -DTRITON_ENABLE_PERF_ANALYZER_TS=OFF \
               -DTRITON_ENABLE_EXAMPLES=ON \
               -DTRITON_ENABLE_TESTS=ON \
-              -DTRITON_ENABLE_ROCM=ON \
+              -DTRITON_ENABLE_GPU=ON \
+              -DTRITON_REPO_ORGANIZATION:STRING=${TRITON_REPO_ORGANIZATION} \
               -DTRITON_COMMON_REPO_TAG=${TRITON_COMMON_REPO_TAG} \
               -DTRITON_CORE_REPO_TAG=${TRITON_CORE_REPO_TAG} \
               -DTRITON_THIRD_PARTY_REPO_TAG=${TRITON_THIRD_PARTY_REPO_TAG} \
@@ -155,7 +157,8 @@ fi
               -DTRITON_ENABLE_PERF_ANALYZER_TS=OFF \
               -DTRITON_ENABLE_EXAMPLES=ON \
               -DTRITON_ENABLE_TESTS=ON \
-              -DTRITON_ENABLE_ROCM=ON \
+              -DTRITON_ENABLE_GPU=ON \
+              -DTRITON_REPO_ORGANIZATION:STRING=${TRITON_REPO_ORGANIZATION} \
               -DTRITON_COMMON_REPO_TAG=${TRITON_COMMON_REPO_TAG} \
               -DTRITON_CORE_REPO_TAG=${TRITON_CORE_REPO_TAG} \
               -DTRITON_THIRD_PARTY_REPO_TAG=${TRITON_THIRD_PARTY_REPO_TAG} \
@@ -184,7 +187,8 @@ fi
               -DTRITON_ENABLE_PERF_ANALYZER_TS=ON \
               -DTRITON_ENABLE_EXAMPLES=ON \
               -DTRITON_ENABLE_TESTS=ON \
-              -DTRITON_ENABLE_ROCM=ON \
+              -DTRITON_ENABLE_GPU=ON \
+              -DTRITON_REPO_ORGANIZATION:STRING=${TRITON_REPO_ORGANIZATION} \
               -DTRITON_COMMON_REPO_TAG=${TRITON_COMMON_REPO_TAG} \
               -DTRITON_CORE_REPO_TAG=${TRITON_CORE_REPO_TAG} \
               -DTRITON_THIRD_PARTY_REPO_TAG=${TRITON_THIRD_PARTY_REPO_TAG} \
@@ -213,7 +217,8 @@ fi
               -DTRITON_ENABLE_PERF_ANALYZER_TS=ON \
               -DTRITON_ENABLE_EXAMPLES=ON \
               -DTRITON_ENABLE_TESTS=ON \
-              -DTRITON_ENABLE_ROCM=ON \
+              -DTRITON_ENABLE_GPU=ON \
+              -DTRITON_REPO_ORGANIZATION:STRING=${TRITON_REPO_ORGANIZATION} \
               -DTRITON_COMMON_REPO_TAG=${TRITON_COMMON_REPO_TAG} \
               -DTRITON_CORE_REPO_TAG=${TRITON_CORE_REPO_TAG} \
               -DTRITON_THIRD_PARTY_REPO_TAG=${TRITON_THIRD_PARTY_REPO_TAG} \
@@ -242,7 +247,8 @@ fi
               -DTRITON_ENABLE_PERF_ANALYZER_TS=OFF \
               -DTRITON_ENABLE_EXAMPLES=ON \
               -DTRITON_ENABLE_TESTS=ON \
-              -DTRITON_ENABLE_ROCM=ON \
+              -DTRITON_ENABLE_GPU=ON \
+              -DTRITON_REPO_ORGANIZATION:STRING=${TRITON_REPO_ORGANIZATION} \
               -DTRITON_COMMON_REPO_TAG=${TRITON_COMMON_REPO_TAG} \
               -DTRITON_CORE_REPO_TAG=${TRITON_CORE_REPO_TAG} \
               -DTRITON_THIRD_PARTY_REPO_TAG=${TRITON_THIRD_PARTY_REPO_TAG} \

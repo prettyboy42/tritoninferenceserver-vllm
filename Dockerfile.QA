@@ -1,4 +1,4 @@
-# Copyright 2018-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2018-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -27,11 +27,13 @@
 ARG BASE_IMAGE=tritonserver
 ARG CIBASE_IMAGE=tritonserver_cibase
 ARG SDK_IMAGE=tritonserver_sdk
+ARG TRITON_REPO_ORGANIZATION=http://github.com/triton-inference-server
 ARG TRITON_COMMON_REPO_TAG=main
 ARG TRITON_CORE_REPO_TAG=main
 ARG TRITON_THIRD_PARTY_REPO_TAG=main
 ARG TRITON_BACKEND_REPO_TAG=main
 ARG TRITONTMP_DIR=/tmp
+ARG IGPU_BUILD=0
 
 ############################################################################
 ## Test artifacts built as part of the tritonserver build are
@@ -40,10 +42,12 @@ ARG TRITONTMP_DIR=/tmp
 FROM ${CIBASE_IMAGE} AS cibase
 
 ARG TRITONTMP_DIR
+ARG TRITON_REPO_ORGANIZATION
 ARG TRITON_COMMON_REPO_TAG
 ARG TRITON_CORE_REPO_TAG
 ARG TRITON_THIRD_PARTY_REPO_TAG
 ARG TRITON_BACKEND_REPO_TAG
+ARG IGPU_BUILD
 
 # Ensure apt-get won't prompt for selecting options
 ENV DEBIAN_FRONTEND=noninteractive
@@ -62,15 +66,13 @@ RUN apt-get update && \
 RUN pip3 install --upgrade pip && \
     pip3 install --upgrade wheel setuptools
 
-RUN apt update && apt install -y gpg wget && \
-    wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | \
-        gpg --dearmor - |  \
-        tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null && \
-    . /etc/os-release && \
-    echo "deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ $UBUNTU_CODENAME main" | \
-    tee /etc/apt/sources.list.d/kitware.list >/dev/null && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends cmake cmake-data
+RUN apt update -q=2 \
+    && apt install -y gpg wget \
+    && wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - |  tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null \
+    && . /etc/os-release \
+    && echo "deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ $UBUNTU_CODENAME main" | tee /etc/apt/sources.list.d/kitware.list >/dev/null \
+    && apt-get update -q=2 \
+    && apt-get install -y --no-install-recommends cmake=3.27.7* cmake-data=3.27.7*
 
 # Add inception_graphdef model to example repo
 WORKDIR /workspace/docs/examples/model_repository
@@ -132,6 +134,8 @@ RUN mkdir -p qa/common && \
     mkdir qa/L0_query/models/query/1 && \
     cp tritonbuild/tritonserver/backends/query/libtriton_query.so qa/L0_query/models/query/1/. && \
     cp bin/query_test qa/L0_query/. && \
+    mkdir qa/L0_iterative_sequence/models/iterative_sequence/1 && \
+    cp tritonbuild/tritonserver/backends/iterative_sequence/libtriton_iterative_sequence.so qa/L0_iterative_sequence/models/iterative_sequence/1/. && \
     cp bin/register_api_test qa/L0_register/. && \
     cp bin/async_work_queue_test qa/L0_async_work_queue/. && \
     cp tritonbuild/tritonserver/backends/implicit_state/libtriton_implicit_state.so \
@@ -148,12 +152,7 @@ RUN mkdir -p qa/common && \
 
 RUN mkdir -p qa/pkgs && \
     cp python/triton*.whl qa/pkgs/. && \
-    cp python/test_binding.py qa/L0_python_api/.
-
-# caffe2plan will not exist if the build was done without TensorRT enabled
-RUN if [ -f bin/caffe2plan ]; then \
-       cp bin/caffe2plan qa/common/.; \
-    fi
+    cp -rf python/test/. qa/L0_python_api/.
 
 RUN mkdir -p qa/L0_simple_ensemble/models/simple/1 && \
     cp docs/examples/model_repository/simple/1/model.graphdef \
@@ -181,6 +180,7 @@ RUN cd tritonbuild/identity && \
     rm -rf install build && mkdir build && cd build && \
     cmake -DTRITON_ENABLE_GPU=OFF \
         -DCMAKE_INSTALL_PREFIX:PATH=/workspace/tritonbuild/identity/install \
+        -DTRITON_REPO_ORGANIZATION:STRING=${TRITON_REPO_ORGANIZATION} \
         -DTRITON_COMMON_REPO_TAG:STRING=${TRITON_COMMON_REPO_TAG} \
         -DTRITON_CORE_REPO_TAG:STRING=${TRITON_CORE_REPO_TAG} \
         -DTRITON_THIRD_PARTY_REPO_TAG:STRING=${TRITON_THIRD_PARTY_REPO_TAG} \
@@ -191,6 +191,7 @@ RUN cd tritonbuild/identity && \
 RUN cd tritonbuild/python && \
     rm -rf install build && mkdir build && cd build && \
     cmake -DCMAKE_INSTALL_PREFIX:PATH=/workspace/tritonbuild/python/install \
+        -DTRITON_REPO_ORGANIZATION:STRING=${TRITON_REPO_ORGANIZATION} \
         -DTRITON_COMMON_REPO_TAG:STRING=${TRITON_COMMON_REPO_TAG} \
         -DTRITON_CORE_REPO_TAG:STRING=${TRITON_CORE_REPO_TAG} \
         -DTRITON_BACKEND_REPO_TAG:STRING=${TRITON_BACKEND_REPO_TAG} .. && \
@@ -237,20 +238,22 @@ RUN if [ -d qa/L0_model_control_stress ]; then \
             cp -r qa/L0_model_control_stress/. qa/L0_model_control_stress_valgrind_massif; \
     fi
 
-RUN cp backends/repeat/libtriton_repeat.so qa/L0_model_config/.
-
 RUN mkdir -p qa/L0_decoupled/models/repeat_int32/1 && \
-    cp backends/repeat/libtriton_repeat.so \
-        qa/L0_decoupled/models/repeat_int32/1/.
-RUN mkdir -p qa/L0_decoupled/models/square_int32/1 && \
-    cp backends/square/libtriton_square.so \
-        qa/L0_decoupled/models/square_int32/1/.
-RUN mkdir -p qa/L0_decoupled/models/identity_int32/1
-RUN mkdir -p qa/L0_decoupled/models/simple_repeat/1 && \
+    mkdir -p qa/L0_decoupled/models/square_int32/1 && \
+    mkdir -p qa/L0_decoupled/models/identity_int32/1 && \
+    mkdir -p qa/L0_decoupled/models/simple_repeat/1 && \
     mkdir -p qa/L0_decoupled/models/fan_repeat/1 && \
     mkdir -p qa/L0_decoupled/models/sequence_repeat/1 && \
     mkdir -p qa/L0_decoupled/models/repeat_square/1 && \
-    mkdir -p qa/L0_decoupled/models/nested_square/1
+    mkdir -p qa/L0_decoupled/models/nested_square/1 && \
+    mkdir -p qa/L0_grpc_state_cleanup/models/repeat_int32/1
+
+RUN if [ "$IGPU_BUILD" == "0" ]; then \
+        cp backends/repeat/libtriton_repeat.so qa/L0_model_config && \
+        cp backends/repeat/libtriton_repeat.so qa/L0_decoupled/models/repeat_int32/1 && \
+        cp backends/repeat/libtriton_repeat.so qa/L0_grpc_state_cleanup/models/repeat_int32/1/. && \
+        cp backends/square/libtriton_square.so qa/L0_decoupled/models/square_int32/1; \
+    fi
 
 RUN cp -r qa/L0_decoupled/models qa/L0_decoupled/python_models/ && \
     cp /workspace/tritonbuild/python/examples/decoupled/repeat_model.py \
@@ -261,10 +264,6 @@ RUN cp -r qa/L0_decoupled/models qa/L0_decoupled/python_models/ && \
         qa/L0_decoupled/python_models/square_int32/1/. && \
     cp /workspace/tritonbuild/python/examples/decoupled/square_config.pbtxt \
         qa/L0_decoupled/python_models/square_int32/.
-
-RUN mkdir -p qa/L0_grpc_state_cleanup/models/repeat_int32/1 && \
-    cp backends/repeat/libtriton_repeat.so \
-        qa/L0_grpc_state_cleanup/models/repeat_int32/1/.
 
 RUN mkdir -p qa/L0_repoagent_checksum/models/identity_int32/1 && \
     cp tritonbuild/identity/install/backends/identity/libtriton_identity.so \
@@ -354,19 +353,18 @@ RUN pip3 install --upgrade wheel setuptools && \
 
 # go needed for example go client test.
 RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
-      wget https://golang.org/dl/go1.19.1.linux-arm64.tar.gz && \
-      rm -rf /usr/local/go && tar -C /usr/local -xzf go1.19.1.linux-arm64.tar.gz && \
-      rm -f go1.19.1.linux-arm64.tar.gz; \
+      wget https://golang.org/dl/go1.22.3.linux-arm64.tar.gz && \
+      rm -rf /usr/local/go && tar -C /usr/local -xzf go1.22.3.linux-arm64.tar.gz && \
+      rm -f go1.22.3.linux-arm64.tar.gz; \
     else \
-      wget https://golang.org/dl/go1.19.1.linux-amd64.tar.gz && \
-      rm -rf /usr/local/go && tar -C /usr/local -xzf go1.19.1.linux-amd64.tar.gz && \
-      rm -f go1.19.1.linux-amd64.tar.gz; \
+      wget https://golang.org/dl/go1.22.3.linux-amd64.tar.gz && \
+      rm -rf /usr/local/go && tar -C /usr/local -xzf go1.22.3.linux-amd64.tar.gz && \
+      rm -f go1.22.3.linux-amd64.tar.gz; \
     fi
 ENV GOPATH /root/go
 ENV PATH $PATH:/usr/local/go/bin:$GOPATH/bin
-RUN GO111MODULE=off go get github.com/golang/protobuf/protoc-gen-go && \
-    GO111MODULE=off go get google.golang.org/grpc
-
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@latest && \
+    go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
 # CI expects tests in /opt/tritonserver/qa. The triton-server (1000)
 # user should own all artifacts in case CI is run using triton-server
 # user.
@@ -382,7 +380,7 @@ RUN rm -fr qa/L0_copyrights qa/L0_build_variants && \
 
 # Install Triton Python API
 RUN find qa/pkgs/ -maxdepth 1 -type f -name \
-    "tritonserver-*.whl" | xargs pip3 install --upgrade
+    "tritonserver-*.whl" | xargs -I {} pip3 install --upgrade {}[all]
 
 ENV LD_LIBRARY_PATH /opt/tritonserver/qa/clients:${LD_LIBRARY_PATH}
 

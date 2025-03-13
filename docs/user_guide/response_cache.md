@@ -58,15 +58,19 @@ sections below for more details.
 
 ### Enable Caching on Server-side
 
-The response cache is enabled on the server-side by specifying a
-`<cache_implementation>` and corresponding configuration when starting
+The response cache is enabled on the server-side by specifying a cache
+implementation name `<cache>` and corresponding configuration when starting
 the Triton server.
 
 Through the CLI, this translates to setting
-`tritonserver --cache-config <cache_implementation>,<key>=<value> ...`. For example:
+`tritonserver --cache-config <cache>,<key>=<value> ...`. For example:
 ```
 tritonserver --cache-config local,size=1048576
 ```
+
+> [!NOTE]
+> If using a non-interactive shell, you may need to specify the argument without
+> the space like so: `--cache-config=<cache>,<key>=<value>`.
 
 For in-process C API applications, this translates to calling
 `TRITONSERVER_SetCacheConfig(const char* cache_implementation, const char* config_json)`.
@@ -217,6 +221,30 @@ fast/cheap (the model is not compute-bound), the cache can negatively impact
 the overall performance due to the overhead of managing and communicating with
 the cache.
 
+## Ensemble Model Caching
+
+Top-level requests to ensemble models support caching if all composing models
+within the ensemble support caching as well.
+
+Similarly, if a composing model in the ensemble doesn't support caching,
+then the ensemble model would inherit this limitation and not support
+caching either. See the known limitations below for what types of models
+support caching.
+
+A cache hit on an ensemble will skip sending requests to the composing models
+entirely, and return the cached response from the ensemble model.
+
+A cache miss on an ensemble will fallback to standard inference and the request
+will proceed to the composing models as usual.
+
+The ensemble and its composing models can independently enable caching, and
+each maintain their own caches when enabled. It is possible for a request
+to be a cache miss at the ensemble level, but then for an intermediate model
+within the ensemble to have a cache hit, depending on the inputs and outputs
+of models being composed. Composing models do not need to enable caching to
+enable it at the ensemble level.
+
+
 ## Known Limitations
 
 - Only input tensors located in CPU memory will be hashable for accessing the
@@ -237,3 +265,4 @@ the cache.
   response caching.
 - The response cache does not currently support
   [decoupled models](decoupled_models.md).
+

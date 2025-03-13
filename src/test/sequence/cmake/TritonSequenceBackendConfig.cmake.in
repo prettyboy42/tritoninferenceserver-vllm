@@ -37,4 +37,3 @@ if(NOT TARGET TritonSequenceBackend::triton-sequence-backend)
 endif()
 
 set(TRITONSEQUENCEBACKEND_LIBRARIES TritonSequenceBackend::triton-sequence-backend)
-

@@ -40,17 +40,17 @@ include(FetchContent)
 
 FetchContent_Declare(
   repo-common
-  GIT_REPOSITORY https://github.com/triton-inference-server/common.git
+  GIT_REPOSITORY ${TRITON_REPO_ORGANIZATION}/common.git
   GIT_TAG ${TRITON_COMMON_REPO_TAG}
 )
 FetchContent_Declare(
   repo-core
-  GIT_REPOSITORY https://github.com/triton-inference-server/core.git
+  GIT_REPOSITORY ${TRITON_REPO_ORGANIZATION}/core.git
   GIT_TAG ${TRITON_CORE_REPO_TAG}
 )
 FetchContent_Declare(
   repo-backend
-  GIT_REPOSITORY https://github.com/triton-inference-server/backend.git
+  GIT_REPOSITORY ${TRITON_REPO_ORGANIZATION}/backend.git
   GIT_TAG ${TRITON_BACKEND_REPO_TAG}
 )
 
@@ -95,7 +95,7 @@ endif()
 
 # re2
 #
-find_library(RE2_LIBRARY NAMES re2)
+find_package(re2 REQUIRED)
 
 #
 # tritonserver executable
@@ -124,7 +124,7 @@ if (NOT WIN32)
   set_property(TARGET main PROPERTY OUTPUT_NAME tritonserver)
 endif()
 
-target_compile_features(main PRIVATE cxx_std_11)
+target_compile_features(main PRIVATE cxx_std_${TRITON_MIN_CXX_STANDARD})
 if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   message("Using MSVC as compiler, default target on Windows 10. "
     "If the target system is not Windows 10, please update _WIN32_WINNT "
@@ -132,7 +132,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   target_compile_options(
     main
     PRIVATE
-      /W1 /D_WIN32_WINNT=0x0A00 /EHsc
+      /W1 /D_WIN32_WINNT=0x0A00 /EHsc /Zc:preprocessor
   )
   target_compile_definitions(main
     PRIVATE
@@ -141,7 +141,7 @@ else()
   target_compile_options(
     main
     PRIVATE
-      -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations 
+      -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -Werror
   )
 endif()
 
@@ -374,12 +374,12 @@ if(${TRITON_ENABLE_HTTP}
     ${HTTP_ENDPOINT_SRCS} ${HTTP_ENDPOINT_HDRS}
   )
 
-  target_compile_features(http-endpoint-library PRIVATE cxx_std_11)
+  target_compile_features(http-endpoint-library PRIVATE cxx_std_${TRITON_MIN_CXX_STANDARD})
   if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     target_compile_options(
       http-endpoint-library
       PRIVATE
-        /W1 /D_WIN32_WINNT=0x0A00 /EHsc
+        /W1 /D_WIN32_WINNT=0x0A00 /EHsc /Zc:preprocessor
     )
   else()
     target_compile_options(
@@ -404,7 +404,7 @@ if(${TRITON_ENABLE_HTTP}
       triton-core-serverstub  # from repo-core
       ${LIBEVENT_LIBRARIES}
       libevhtp::evhtp
-      ${RE2_LIBRARY}
+      re2::re2
   )
 
   target_include_directories(
@@ -542,9 +542,9 @@ if(${TRITON_ENABLE_TRACING})
     tracer.cc tracer.h
   )
 
-  if (NOT WIN32)
-    target_compile_features(tracing-library PRIVATE cxx_std_17)
+  target_compile_features(tracing-library PRIVATE cxx_std_${TRITON_MIN_CXX_STANDARD})
 
+  if (NOT WIN32)
     target_include_directories(
       tracing-library
       PRIVATE ${OPENTELEMETRY_CPP_INCLUDE_DIRS}
@@ -560,6 +560,7 @@ if(${TRITON_ENABLE_TRACING})
     tracing-library
     PUBLIC
       triton-common-logging    # from repo-common
+      triton-common-json      # from repo-common
       triton-core-serverapi    # from repo-core
       triton-core-serverstub   # from repo-core
   )
@@ -596,7 +597,6 @@ if(${TRITON_ENABLE_TRACING})
         hip::host
     )
   endif() # TRITON_ENABLE_ROCM
-
 
   if(${TRITON_ENABLE_METRICS})
     target_compile_definitions(
@@ -642,7 +642,7 @@ if (NOT WIN32)
     simple.cc
   )
 
-  target_compile_features(simple PRIVATE cxx_std_11)
+  target_compile_features(simple PRIVATE cxx_std_${TRITON_MIN_CXX_STANDARD})
   if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     message("Using MSVC as compiler, default target on Windows 10. "
             "If the target system is not Windows 10, please update _WIN32_WINNT "
@@ -650,7 +650,7 @@ if (NOT WIN32)
     target_compile_options(
       simple
       PRIVATE
-        /W1 /D_WIN32_WINNT=0x0A00 /EHsc
+        /W1 /D_WIN32_WINNT=0x0A00 /EHsc /Zc:preprocessor
     )
   else()
     target_compile_options(
@@ -707,7 +707,6 @@ if (NOT WIN32)
     )
   endif() # TRITON_ENABLE_ROCM
 
-
   install(
     TARGETS simple
     RUNTIME DESTINATION bin
@@ -721,7 +720,7 @@ if (NOT WIN32)
     multi_server.cc
   )
 
-  target_compile_features(multi_server PRIVATE cxx_std_11)
+  target_compile_features(multi_server PRIVATE cxx_std_${TRITON_MIN_CXX_STANDARD})
   if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     message("Using MSVC as compiler, default target on Windows 10. "
             "If the target system is not Windows 10, please update _WIN32_WINNT "
@@ -729,7 +728,7 @@ if (NOT WIN32)
     target_compile_options(
       multi_server
       PRIVATE
-        /W1 /D_WIN32_WINNT=0x0A00 /EHsc
+        /W1 /D_WIN32_WINNT=0x0A00 /EHsc /Zc:preprocessor
     )
   else()
     target_compile_options(
@@ -800,7 +799,7 @@ if (NOT WIN32)
       memory_alloc.cc
     )
 
-    target_compile_features(memory_alloc PRIVATE cxx_std_11)
+    target_compile_features(memory_alloc PRIVATE cxx_std_${TRITON_MIN_CXX_STANDARD})
     if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
       message("Using MSVC as compiler, default target on Windows 10. "
               "If the target system is not Windows 10, please update _WIN32_WINNT "
@@ -808,7 +807,7 @@ if (NOT WIN32)
       target_compile_options(
         memory_alloc
         PRIVATE
-          /W1 /D_WIN32_WINNT=0x0A00 /EHsc
+          /W1 /D_WIN32_WINNT=0x0A00 /EHsc /Zc:preprocessor
       )
     else()
       target_compile_options(
@@ -914,8 +913,6 @@ endif() # NOT WIN32
 # Currently unit tests do not build for windows...
 #if (NOT TRITON_ENABLE_ROCM)
 if ( NOT WIN32) 
-  if ( NOT EXISTS "/etc/ld.so.conf.d/nvidia-tegra.conf" )
-    add_subdirectory(test test)
-  endif()
+  add_subdirectory(test test)
 endif() # NOT WIN32
 #endif () # NOT TRITON_ENABLE_ROCM

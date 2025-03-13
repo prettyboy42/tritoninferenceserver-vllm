@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2020-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2020-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -46,7 +46,7 @@ PERF_ANALYZER=../clients/perf_analyzer
 IMAGE=../images/vulture.jpeg
 
 # Models
-CAFFE2PLAN=../common/caffe2plan
+TRTEXEC=/usr/src/tensorrt/bin/trtexec
 DATADIR=/data/inferenceserver/${REPO_VERSION}
 
 # Server
@@ -70,7 +70,7 @@ rm -rf *.log models/ *.massif
 # Test parameters
 STATIC_BATCH=128
 INSTANCE_CNT=2
-CONCURRENCY=32
+CONCURRENCY=20
 CLIENT_BS=8
 
 # Set the number of repetitions in nightly and weekly tests
@@ -87,7 +87,7 @@ if [ "$TRITON_PERF_WEEKLY" == 1 ]; then
         EMAIL_SUBJECT="Weekly"
     fi
 else
-    REPETITION=3
+    REPETITION=10
     EMAIL_SUBJECT="Nightly"
 fi
 
@@ -103,23 +103,28 @@ export MAX_ALLOWED_ALLOC="100"
 mkdir -p models/
 cp -r $DATADIR/perf_model_store/resnet50* models/
 
-# Copy and prepare trt model
-cp -r $DATADIR/caffe_models/trt_model_store/resnet50_plan models/resnet50_fp16_plan
-mkdir -p models/resnet50_fp16_plan/1
-sed -i "s/^name:.*/name: \"resnet50_fp16_plan\"/" models/resnet50_fp16_plan/config.pbtxt
+# Create the TensorRT plan from ONNX model
+rm -fr models/resnet50_fp32_plan && mkdir -p models/resnet50_fp32_plan/1 && \
+cp $DATADIR/qa_dynamic_batch_image_model_repository/resnet50_onnx/1/model.onnx models/resnet50_fp32_plan/ && \
+cp $DATADIR/qa_dynamic_batch_image_model_repository/resnet50_onnx/labels.txt models/resnet50_fp32_plan/
 
 set +e
+# Build TRT engine
+$TRTEXEC --onnx=models/resnet50_fp32_plan/model.onnx --saveEngine=models/resnet50_fp32_plan/1/model.plan \
+         --minShapes=input:1x3x224x224 --optShapes=input:${STATIC_BATCH}x3x224x224 \
+         --maxShapes=input:${STATIC_BATCH}x3x224x224
 
-# Create the PLAN
-$CAFFE2PLAN -h -b ${STATIC_BATCH} \
-    -n prob -o models/resnet50_fp16_plan/1/model.plan \
-    $DATADIR/caffe_models/resnet50.prototxt $DATADIR/caffe_models/resnet50.caffemodel
 if [ $? -ne 0 ]; then
     echo -e "\n***\n*** Failed to generate resnet50 PLAN\n***"
     exit 1
 fi
 
 set -e
+
+rm models/resnet50_fp32_plan/model.onnx
+cp $DATADIR/qa_dynamic_batch_image_model_repository/resnet50_onnx/config.pbtxt models/resnet50_fp32_plan/ && \
+sed -i "s/^name: .*/name: \"resnet50_fp32_plan\"/g" models/resnet50_fp32_plan/config.pbtxt && \
+sed -i 's/^platform: .*/platform: "tensorrt_plan"/g' models/resnet50_fp32_plan/config.pbtxt
 
 RET=0
 
@@ -169,7 +174,7 @@ for MODEL in $(ls models); do
     # Run the perf analyzer 'REPETITION' times
     for ((i=1; i<=$REPETITION; i++)); do
         # [TMA-621] Use --no-stability mode in perf analyzer when available
-        $PERF_ANALYZER -v -m $MODEL -i grpc --concurrency-range $CONCURRENCY -b $CLIENT_BS > $TEMP_CLIENT_LOG 2>&1
+        $PERF_ANALYZER -v -m $MODEL -i grpc --concurrency-range $CONCURRENCY -b $CLIENT_BS -p 10000 > $TEMP_CLIENT_LOG 2>&1
         PA_RET=$?
         # Success
         if [ ${PA_RET} -eq 0 ]; then
@@ -213,20 +218,18 @@ for MODEL in $(ls models); do
     set -e
 done
 
-# Next perform a test that has unbound memory growth. Use the busy op model
-# with a high delay in order to force requests to sit in the queue, and result
+# Next perform a test that has unbound memory growth. Use the busy op Python model
+# with a sleep function in order to force requests to sit in the queue, and result
 # in memory growth.
 BUSY_OP_TEST=busy_op_test.py
-DELAY_CYCLES=2100000000
 NUM_REQUESTS=100
 
 rm -rf test_repo && mkdir test_repo
-cp -r ${DATADIR}/qa_custom_ops/tf_custom_ops/graphdef_busyop test_repo/
+mkdir -p test_repo/busy_op/1/
+cp ../python_models/busy_op/model.py test_repo/busy_op/1/
+cp ../python_models/busy_op/config.pbtxt test_repo/busy_op
 
-# Explicitly set library path so custom ops can find TF
-LD_LIBRARY_PATH=/opt/tritonserver/backends/tensorflow:$LD_LIBRARY_PATH
 SERVER_ARGS="--model-repository=`pwd`/test_repo"
-SERVER_LD_PRELOAD="${DATADIR}/qa_custom_ops/tf_custom_ops/libbusyop.so"
 
 LEAKCHECK_LOG="test_busyop.valgrind.log"
 MASSIF_LOG="test_busyop.massif"
@@ -254,12 +257,12 @@ set +e
 # Run the busy_op test if no PTX issue was observed when launching server
 if [ $SKIP_BUSYOP -ne 1 ]; then
     SECONDS=0
-    python $BUSY_OP_TEST -v -m graphdef_busyop -d $DELAY_CYCLES -n $NUM_REQUESTS > $CLIENT_LOG 2>&1
+    python $BUSY_OP_TEST -v -m busy_op -n $NUM_REQUESTS > $CLIENT_LOG 2>&1
     TEST_RETCODE=$?
     TEST_DURATION=$SECONDS
     if [ ${TEST_RETCODE} -ne 0 ]; then
         cat $CLIENT_LOG
-        echo -e "\n***\n*** Test graphdef_busyop Failed\n***"
+        echo -e "\n***\n*** busy_op_test.py Failed\n***"
         RET=1
     fi
     set -e
@@ -291,12 +294,13 @@ if [ $SKIP_BUSYOP -ne 1 ]; then
     # Always output memory usage for easier triage of MAX_ALLOWED_ALLOC settings in the future
     grep -i "Change in memory allocation" "${CLIENT_LOG}" || true
 fi
+
 set -e
 
 if [ $RET -eq 0 ]; then
     echo -e "\n***\n*** Test Passed\n***"
 else
-    echo -e "\n***\n*** Test FAILED\n***"
+    echo -e "\n***\n*** Test Failed\n***"
 fi
 
 # Run only if both TRITON_FROM and TRITON_TO_DL are set

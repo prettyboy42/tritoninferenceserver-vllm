@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2020-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2020-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -45,12 +45,13 @@ SERVER=${TRITON_DIR}/bin/tritonserver
 BASE_SERVER_ARGS="--model-repository=${MODELDIR}"
 SERVER_ARGS="${BASE_SERVER_ARGS}"
 SERVER_LOG="./inference_server.log"
+PYTHON_TEST="metrics_config_test.py"
 source ../common/util.sh
 
 CLIENT_LOG="client.log"
 TEST_RESULT_FILE="test_results.txt"
 function check_unit_test() {
-    if [ $? -ne 0 ]; then
+    if [ "${PIPESTATUS[0]}" -ne 0 ]; then
         cat $CLIENT_LOG
         echo -e "\n***\n*** Test Failed\n***"
         RET=1
@@ -86,7 +87,7 @@ fi
 ### UNIT TESTS
 
 TEST_LOG="./metrics_api_test.log"
-UNIT_TEST=./metrics_api_test
+UNIT_TEST="./metrics_api_test --gtest_output=xml:metrics_api.report.xml"
 
 rm -fr *.log
 
@@ -100,8 +101,6 @@ if [ $? -ne 0 ]; then
 fi
 set -e
 
-### GPU Metrics
-
 # Prepare a libtorch float32 model with basic config
 rm -rf $MODELDIR
 model=libtorch_float32_float32_float32
@@ -112,8 +111,41 @@ mkdir -p $MODELDIR/${model}/1 && \
   sed -i "s/label_filename:.*//" config.pbtxt && \
   echo "instance_group [{ kind: KIND_GPU }]" >> config.pbtxt)
 
+### Pinned memory metrics tests
+set +e
+CLIENT_PY="./pinned_memory_metrics_test.py"
+SERVER_LOG="pinned_memory_metrics_test_server.log"
+SERVER_ARGS="$BASE_SERVER_ARGS --metrics-interval-ms=1 --model-control-mode=explicit --log-verbose=1"
+run_and_check_server
+python3 ${PYTHON_TEST} MetricsConfigTest.test_pinned_memory_metrics_exist -v 2>&1 | tee ${CLIENT_LOG}
+check_unit_test
+
+CLIENT_LOG="pinned_memory_metrics_test_client.log"
+python3 ${CLIENT_PY} -v 2>&1 | tee ${CLIENT_LOG}
+check_unit_test
+
+kill $SERVER_PID
+wait $SERVER_PID
+
+# Custom Pinned memory pool size
+export CUSTOM_PINNED_MEMORY_POOL_SIZE=1024 # bytes
+SERVER_LOG="custom_pinned_memory_test_server.log"
+CLIENT_LOG="custom_pinned_memory_test_client.log"
+SERVER_ARGS="$BASE_SERVER_ARGS --metrics-interval-ms=1 --model-control-mode=explicit --log-verbose=1 --pinned-memory-pool-byte-size=$CUSTOM_PINNED_MEMORY_POOL_SIZE"
+run_and_check_server
+python3 ${CLIENT_PY} -v 2>&1 | tee ${CLIENT_LOG}
+check_unit_test
+
+kill $SERVER_PID
+wait $SERVER_PID
+set -e
+
+
+### GPU Metrics
 set +e
 export CUDA_VISIBLE_DEVICES=0,1,2
+SERVER_LOG="./inference_server.log"
+CLIENT_LOG="client.log"
 run_and_check_server
 
 num_gpus=`curl -s localhost:8002/metrics | grep "nv_gpu_utilization{" | wc -l`
@@ -227,7 +259,6 @@ MODELDIR="${PWD}/unit_test_models"
 mkdir -p "${MODELDIR}/identity_cache_on/1"
 mkdir -p "${MODELDIR}/identity_cache_off/1"
 BASE_SERVER_ARGS="--model-repository=${MODELDIR} --model-control-mode=explicit"
-PYTHON_TEST="metrics_config_test.py"
 
 # Check default settings: Counters should be enabled, summaries should be disabled
 SERVER_ARGS="${BASE_SERVER_ARGS} --load-model=identity_cache_off"
@@ -297,6 +328,25 @@ check_unit_test
 kill $SERVER_PID
 wait $SERVER_PID
 
+# Check model namespacing label with namespace on and off
+REPOS_DIR="${PWD}/model_namespacing_repos"
+mkdir -p "${REPOS_DIR}/addsub_repo/addsub_ensemble/1"
+mkdir -p "${REPOS_DIR}/subadd_repo/subadd_ensemble/1"
+# Namespace on
+SERVER_ARGS="--model-repository=${REPOS_DIR}/addsub_repo --model-repository=${REPOS_DIR}/subadd_repo --model-namespacing=true --allow-metrics=true"
+run_and_check_server
+python3 ${PYTHON_TEST} MetricsConfigTest.test_model_namespacing_label_with_namespace_on 2>&1 | tee ${CLIENT_LOG}
+check_unit_test
+kill $SERVER_PID
+wait $SERVER_PID
+# Namespace off
+SERVER_ARGS="--model-repository=${REPOS_DIR}/addsub_repo --model-namespacing=false --allow-metrics=true"
+run_and_check_server
+python3 ${PYTHON_TEST} MetricsConfigTest.test_model_namespacing_label_with_namespace_off 2>&1 | tee ${CLIENT_LOG}
+check_unit_test
+kill $SERVER_PID
+wait $SERVER_PID
+
 ### Pending Request Count (Queue Size) Metric Behavioral Tests ###
 MODELDIR="${PWD}/queue_size_models"
 SERVER_ARGS="--model-repository=${MODELDIR} --log-verbose=1"
@@ -325,6 +375,10 @@ DYNAMIC_MODEL="${MODELDIR}/dynamic"
 cp -r "${DEFAULT_MODEL}" "${DYNAMIC_MODEL}"
 echo -e "\ndynamic_batching { max_queue_delay_microseconds: ${MAX_QUEUE_DELAY_US} }\n" >> "${DYNAMIC_MODEL}/config.pbtxt"
 
+MAX_QUEUE_SIZE_MODEL="${MODELDIR}/max_queue_size"
+cp -r "${DEFAULT_MODEL}" "${MAX_QUEUE_SIZE_MODEL}"
+echo -e "\ndynamic_batching { max_queue_delay_microseconds: ${MAX_QUEUE_DELAY_US} default_queue_policy { max_queue_size: 4 } }\n" >> "${MAX_QUEUE_SIZE_MODEL}/config.pbtxt"
+
 SEQUENCE_DIRECT_MODEL="${MODELDIR}/sequence_direct"
 cp -r "${DEFAULT_MODEL}" "${SEQUENCE_DIRECT_MODEL}"
 echo -e "\nsequence_batching { direct { max_queue_delay_microseconds: ${MAX_QUEUE_DELAY_US}, minimum_slot_utilization: 1.0 } }\n" >> "${SEQUENCE_DIRECT_MODEL}/config.pbtxt"
@@ -347,7 +401,7 @@ run_and_check_server
 python3 ${PYTHON_TEST} 2>&1 | tee ${CLIENT_LOG}
 kill $SERVER_PID
 wait $SERVER_PID
-expected_tests=5
+expected_tests=6
 check_unit_test "${expected_tests}"
 
 if [ $RET -eq 0 ]; then

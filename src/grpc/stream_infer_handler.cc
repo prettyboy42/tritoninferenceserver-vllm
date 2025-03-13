@@ -265,6 +265,12 @@ ModelStreamInferHandler::Process(InferHandler::State* state, bool rpc_ok)
     }
 
     if (err == nullptr) {
+      state->inference_request_ = {
+          irequest, [](TRITONSERVER_InferenceRequest* request) {
+            LOG_TRITONSERVER_ERROR(
+                TRITONSERVER_InferenceRequestDelete(request),
+                "deleting gRPC inference request");
+          }};
       err = SetInferenceRequestMetadata(irequest, request, state->parameters_);
     }
 
@@ -285,9 +291,13 @@ ModelStreamInferHandler::Process(InferHandler::State* state, bool rpc_ok)
           tritonserver_, shm_manager_, request, std::move(serialized_data),
           response_queue_, &state->alloc_payload_);
     }
+
+    auto request_release_payload =
+        std::make_unique<RequestReleasePayload>(state->inference_request_);
     if (err == nullptr) {
       err = TRITONSERVER_InferenceRequestSetReleaseCallback(
-          irequest, InferRequestComplete, nullptr /* request_release_userp */);
+          irequest, InferRequestComplete,
+          request_release_payload.get() /* request_release_userp */);
     }
     if (err == nullptr) {
       err = TRITONSERVER_InferenceRequestSetResponseCallback(
@@ -299,8 +309,10 @@ ModelStreamInferHandler::Process(InferHandler::State* state, bool rpc_ok)
     if (err == nullptr) {
       TRITONSERVER_InferenceTrace* triton_trace = nullptr;
 #ifdef TRITON_ENABLE_TRACING
-      state->trace_ =
-          std::move(trace_manager_->SampleTrace(request.model_name()));
+      GrpcServerCarrier carrier(state->context_->ctx_.get());
+      auto start_options =
+          trace_manager_->GetTraceStartOptions(carrier, request.model_name());
+      state->trace_ = std::move(trace_manager_->SampleTrace(start_options));
       if (state->trace_ != nullptr) {
         triton_trace = state->trace_->trace_;
       }
@@ -317,7 +329,9 @@ ModelStreamInferHandler::Process(InferHandler::State* state, bool rpc_ok)
     // WRITEREADY or WRITTEN or CANCELLED. Recording the state and the
     // irequest to handle gRPC stream cancellation.
     if (err == nullptr) {
-      state->context_->InsertInflightState(state, irequest);
+      state->context_->InsertInflightState(state);
+      // The payload will be cleaned in request release callback.
+      request_release_payload.release();
     } else {
       // If there was an error then enqueue the error response and show
       // it to be ready for writing.
@@ -336,10 +350,6 @@ ModelStreamInferHandler::Process(InferHandler::State* state, bool rpc_ok)
       }
       LOG_VERBOSE(1) << "[request id: " << log_request_id << "] "
                      << "Infer failed: " << TRITONSERVER_ErrorMessage(err);
-
-      LOG_TRITONSERVER_ERROR(
-          TRITONSERVER_InferenceRequestDelete(irequest),
-          "deleting GRPC inference request");
 
       ::grpc::Status status;
       GrpcStatusUtil::Create(&status, err);
@@ -564,9 +574,10 @@ ModelStreamInferHandler::StreamInferResponseComplete(
 #endif  // TRITON_ENABLE_TRACING
 
   // Log appropriate errors
-  state->complete_ = ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) != 0);
+  bool is_complete =
+      state->complete_ || (flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) != 0;
   if (!state->is_decoupled_) {
-    if (!state->complete_) {
+    if (!is_complete) {
       LOG_ERROR << "[INTERNAL] ModelStreamInfer received a response without "
                    "FINAL flag for a model with one-to-one transaction";
     }
@@ -581,7 +592,7 @@ ModelStreamInferHandler::StreamInferResponseComplete(
   // Also make sure that if this state was sent to gRPC async notification
   // mechanism then the state is not removed as it would be needed for handling
   // the cancellation if detected.
-  if (state->complete_ && (!state->IsAsyncNotifyState())) {
+  if (is_complete && (!state->IsAsyncNotifyState())) {
     state->context_->EraseInflightState(state);
   }
 
@@ -600,11 +611,12 @@ ModelStreamInferHandler::StreamInferResponseComplete(
     // If this was the final callback for the state
     // then cycle through the completion queue so
     // that state object can be released.
-    if (state->complete_) {
+    if (is_complete) {
       state->step_ = Steps::CANCELLED;
       state->context_->PutTaskBackToQueue(state);
     }
 
+    state->complete_ = is_complete;
     return;
   }
 
@@ -651,8 +663,7 @@ ModelStreamInferHandler::StreamInferResponseComplete(
   // "empty" responses are not sent back to the client. Clients can
   // opt-in to receiving these empty responses via request parameters.
   // NOTE: The complete flag is the only flag used for this case at this time.
-  const bool empty_final =
-      (!iresponse && state->is_decoupled_ && state->complete_);
+  const bool empty_final = !iresponse && state->is_decoupled_ && is_complete;
   const bool enable_empty_final =
       state->parameters_.enable_empty_final_response_;
 
@@ -680,7 +691,24 @@ ModelStreamInferHandler::StreamInferResponseComplete(
       infer_response.set_model_version(state->request_.model_version());
     }
     auto& params = *(infer_response.mutable_parameters());
-    params["triton_final_response"].set_bool_param(state->complete_);
+    params["triton_final_response"].set_bool_param(is_complete);
+  }
+
+  if (state->delay_complete_ms_ != 0) {
+    // Delay updating the state. This is useful for testing race condition with
+    // the thread that runs Process().
+    LOG_INFO << "Delaying the completion of reporting response / flag by "
+             << state->delay_complete_ms_ << " ms...";
+    void* context_ptr_before_delay = (void*)state->context_.get();
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(state->delay_complete_ms_));
+    void* context_ptr_after_delay = (void*)state->context_.get();
+    if (context_ptr_before_delay != context_ptr_after_delay) {
+      LOG_ERROR << "Should not print this! The state context object has "
+                   "changed after delay, pointer before: "
+                << context_ptr_before_delay
+                << ", pointer after: " << context_ptr_after_delay;
+    }
   }
 
   // Update states to signal that response/error is ready to write to stream
@@ -698,11 +726,12 @@ ModelStreamInferHandler::StreamInferResponseComplete(
       // If this was the final callback for the state
       // then cycle through the completion queue so
       // that state object can be released.
-      if (state->complete_) {
+      if (is_complete) {
         state->step_ = Steps::CANCELLED;
         state->context_->PutTaskBackToQueue(state);
       }
 
+      state->complete_ = is_complete;
       return;
     }
 
@@ -718,6 +747,8 @@ ModelStreamInferHandler::StreamInferResponseComplete(
       state->step_ = Steps::WRITEREADY;
       state->context_->WriteResponseIfReady(state);
     }
+
+    state->complete_ = is_complete;
   }
 }
 

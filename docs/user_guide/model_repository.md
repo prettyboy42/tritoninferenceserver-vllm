@@ -1,5 +1,5 @@
 <!--
-# Copyright 2018-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2018-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -57,6 +57,8 @@ The corresponding repository layout must be:
     <model-name>/
       [config.pbtxt]
       [<output-labels-file> ...]
+      [configs]/
+        [<custom-config-file> ...]
       <version>/
         <model-definition-file>
       <version>/
@@ -65,6 +67,8 @@ The corresponding repository layout must be:
     <model-name>/
       [config.pbtxt]
       [<output-labels-file> ...]
+      [configs]/
+        [<custom-config-file> ...]
       <version>/
         <model-definition-file>
       <version>/
@@ -83,10 +87,15 @@ config.pbtxt is required while for others it is optional. See
 Configuration](model_configuration.md#auto-generated-model-configuration)
 for more information.
 
+Each <model-name> directory may include an optional sub-directory configs.
+Within the configs directory there must be zero or more <custom-config-file>
+with .pbtxt file extension. For more information about how the custom model
+configuration is handled by Triton see [Custom Model Configuration](https://github.com/triton-inference-server/server/blob/main/docs/user_guide/model_configuration.md#custom-model-configuration).
+
 Each <model-name> directory must have at least one numeric
-sub-directory representing a version of the model.  For more
+sub-directory representing a version of the model. For more
 information about how the model versions are handled by Triton see
-[Model Versions](#model-versions).  Each model is executed by a
+[Model Versions](#model-versions). Each model is executed by a
 specific
 [backend](https://github.com/triton-inference-server/backend/blob/main/README.md).
 Within each version sub-directory there must be the files required by
@@ -120,27 +129,29 @@ repository path must be prefixed with gs://.
 $ tritonserver --model-repository=gs://bucket/path/to/model/repository ...
 ```
 
-When using Google Cloud Storage, the
-[GOOGLE_APPLICATION_CREDENTIALS](https://cloud.google.com/docs/authentication/application-default-credentials#GAC)
-environment variable should be set and contains the location of a credential
-JSON file. If no credential is provided, Triton will use credentials from the
-[attached service account](https://cloud.google.com/docs/authentication/application-default-credentials#attached-sa)
-providing a value for the
+When using Google Cloud Storage, credentials are fetched and attempted in the
+following order:
+1. [GOOGLE_APPLICATION_CREDENTIALS environment variable](https://cloud.google.com/docs/authentication/application-default-credentials#GAC)
+   - The environment variable should be set and contains the location of a
+credential JSON file.
+   - Authorized user credential will be attempted first, and then service
+account credential.
+2. [The attached service account](https://cloud.google.com/docs/authentication/application-default-credentials#attached-sa)
+   - A value for the
 [Authorization HTTP header](https://googleapis.dev/cpp/google-cloud-storage/1.42.0/classgoogle_1_1cloud_1_1storage_1_1oauth2_1_1ComputeEngineCredentials.html#a8c3a5d405366523e2f4df06554f0a676)
-can be obtained. If not obtainable, anonymous credential will be used.
-
-To access buckets with anonymous credential (also known as public bucket), the
-bucket (and objects) should have granted `get` and `list` permission to all
-users. It is tested that adding both
+should be obtainable.
+3. Anonymous credential (also known as public bucket)
+   - The bucket (and objects) should have granted `get` and `list` permission to
+all users.
+   - One way to grant such permission is by adding both
 [storage.objectViewer](https://cloud.google.com/storage/docs/access-control/iam-roles#standard-roles)
 and
 [storage.legacyBucketReader](https://cloud.google.com/storage/docs/access-control/iam-roles#legacy-roles)
-predefined roles for "allUsers" to the bucket can accomplish that, which can be
-added by the following commands:
-```
-$ gsutil iam ch allUsers:objectViewer "${BUCKET_URL}"
-$ gsutil iam ch allUsers:legacyBucketReader "${BUCKET_URL}"
-```
+predefined roles for "allUsers" to the bucket, for example:
+        ```
+        $ gsutil iam ch allUsers:objectViewer "${BUCKET_URL}"
+        $ gsutil iam ch allUsers:legacyBucketReader "${BUCKET_URL}"
+        ```
 
 By default, Triton makes a local copy of a remote model repository in
 a temporary folder, which is deleted after Triton server is shut down.

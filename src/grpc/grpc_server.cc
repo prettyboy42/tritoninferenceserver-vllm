@@ -1,4 +1,4 @@
-// Copyright 2019-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2019-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -92,10 +92,11 @@ class CommonCallData : public ICallData {
       const StandardRegisterFunc OnRegister,
       const StandardCallbackFunc OnExecute, const bool async,
       ::grpc::ServerCompletionQueue* cq,
-      const std::pair<std::string, std::string>& restricted_kv)
+      const std::pair<std::string, std::string>& restricted_kv,
+      const uint64_t& response_delay = 0)
       : name_(name), id_(id), OnRegister_(OnRegister), OnExecute_(OnExecute),
         async_(async), cq_(cq), responder_(&ctx_), step_(Steps::START),
-        restricted_kv_(restricted_kv)
+        restricted_kv_(restricted_kv), response_delay_(response_delay)
   {
     OnRegister_(&ctx_, &request_, &responder_, this);
     LOG_VERBOSE(1) << "Ready for RPC '" << name_ << "', " << id_;
@@ -140,6 +141,8 @@ class CommonCallData : public ICallData {
   Steps step_;
 
   std::pair<std::string, std::string> restricted_kv_{"", ""};
+
+  const uint64_t response_delay_;
 };
 
 template <typename ResponderType, typename RequestType, typename ResponseType>
@@ -165,7 +168,8 @@ CommonCallData<ResponderType, RequestType, ResponseType>::Process(bool rpc_ok)
     // Start a new request to replace this one...
     if (!shutdown) {
       new CommonCallData<ResponderType, RequestType, ResponseType>(
-          name_, id_ + 1, OnRegister_, OnExecute_, async_, cq_, restricted_kv_);
+          name_, id_ + 1, OnRegister_, OnExecute_, async_, cq_, restricted_kv_,
+          response_delay_);
     }
 
     if (!async_) {
@@ -234,6 +238,14 @@ template <typename ResponderType, typename RequestType, typename ResponseType>
 void
 CommonCallData<ResponderType, RequestType, ResponseType>::WriteResponse()
 {
+  if (response_delay_ != 0) {
+    // Will delay the write of the response by the specified time.
+    // This can be used to test the flow where there are other
+    // responses available to be written.
+    LOG_VERBOSE(1) << "Delaying the write of the response by "
+                   << response_delay_ << " seconds";
+    std::this_thread::sleep_for(std::chrono::seconds(response_delay_));
+  }
   step_ = Steps::COMPLETE;
   responder_.Finish(response_, status_, this);
 }
@@ -253,8 +265,7 @@ class CommonHandler : public HandlerBase {
       inference::GRPCInferenceService::AsyncService* service,
       ::grpc::health::v1::Health::AsyncService* health_service,
       ::grpc::ServerCompletionQueue* cq,
-      std::map<std::string, std::pair<std::string, std::string>>
-          restricted_keys);
+      const RestrictedFeatures& restricted_keys, const uint64_t response_delay);
 
   // Descriptive name of of the handler.
   const std::string& Name() const { return name_; }
@@ -289,6 +300,13 @@ class CommonHandler : public HandlerBase {
   void RegisterRepositoryModelLoad();
   void RegisterRepositoryModelUnload();
 
+  // Set count and cumulative duration for 'RegisterModelStatistics()'
+  template <typename PBTYPE>
+  TRITONSERVER_Error* SetStatisticsDuration(
+      triton::common::TritonJson::Value& statistics_json,
+      const std::string& statistics_name,
+      PBTYPE* mutable_statistics_duration_protobuf) const;
+
   const std::string name_;
   std::shared_ptr<TRITONSERVER_Server> tritonserver_;
 
@@ -299,12 +317,9 @@ class CommonHandler : public HandlerBase {
   ::grpc::health::v1::Health::AsyncService* health_service_;
   ::grpc::ServerCompletionQueue* cq_;
   std::unique_ptr<std::thread> thread_;
-  std::map<std::string, std::pair<std::string, std::string>> restricted_keys_;
-  static std::pair<std::string, std::string> empty_restricted_key_;
+  RestrictedFeatures restricted_keys_{};
+  const uint64_t response_delay_ = 0;
 };
-
-std::pair<std::string, std::string> CommonHandler::empty_restricted_key_{
-    "", ""};
 
 CommonHandler::CommonHandler(
     const std::string& name,
@@ -314,11 +329,12 @@ CommonHandler::CommonHandler(
     inference::GRPCInferenceService::AsyncService* service,
     ::grpc::health::v1::Health::AsyncService* health_service,
     ::grpc::ServerCompletionQueue* cq,
-    std::map<std::string, std::pair<std::string, std::string>> restricted_keys)
+    const RestrictedFeatures& restricted_keys,
+    const uint64_t response_delay = 0)
     : name_(name), tritonserver_(tritonserver), shm_manager_(shm_manager),
       trace_manager_(trace_manager), service_(service),
       health_service_(health_service), cq_(cq),
-      restricted_keys_(restricted_keys)
+      restricted_keys_(restricted_keys), response_delay_(response_delay)
 {
 }
 
@@ -439,14 +455,13 @@ CommonHandler::RegisterServerLive()
     TRITONSERVER_ErrorDelete(err);
   };
 
-  const auto it = restricted_keys_.find("health");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::HEALTH);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<inference::ServerLiveResponse>,
       inference::ServerLiveRequest, inference::ServerLiveResponse>(
       "ServerLive", 0, OnRegisterServerLive, OnExecuteServerLive,
-      false /* async */, cq_, restricted_kv);
+      false /* async */, cq_, restricted_kv, response_delay_);
 }
 
 void
@@ -476,14 +491,13 @@ CommonHandler::RegisterServerReady()
     TRITONSERVER_ErrorDelete(err);
   };
 
-  const auto it = restricted_keys_.find("health");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::HEALTH);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<inference::ServerReadyResponse>,
       inference::ServerReadyRequest, inference::ServerReadyResponse>(
       "ServerReady", 0, OnRegisterServerReady, OnExecuteServerReady,
-      false /* async */, cq_, restricted_kv);
+      false /* async */, cq_, restricted_kv, response_delay_);
 }
 
 void
@@ -524,16 +538,15 @@ CommonHandler::RegisterHealthCheck()
     TRITONSERVER_ErrorDelete(err);
   };
 
-  const auto it = restricted_keys_.find("health");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::HEALTH);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<
           ::grpc::health::v1::HealthCheckResponse>,
       ::grpc::health::v1::HealthCheckRequest,
       ::grpc::health::v1::HealthCheckResponse>(
       "Check", 0, OnRegisterHealthCheck, OnExecuteHealthCheck,
-      false /* async */, cq_, restricted_kv);
+      false /* async */, cq_, restricted_kv, response_delay_);
 }
 
 void
@@ -569,14 +582,13 @@ CommonHandler::RegisterModelReady()
     TRITONSERVER_ErrorDelete(err);
   };
 
-  const auto it = restricted_keys_.find("health");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::HEALTH);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<inference::ModelReadyResponse>,
       inference::ModelReadyRequest, inference::ModelReadyResponse>(
       "ModelReady", 0, OnRegisterModelReady, OnExecuteModelReady,
-      false /* async */, cq_, restricted_kv);
+      false /* async */, cq_, restricted_kv, response_delay_);
 }
 
 void
@@ -648,14 +660,13 @@ CommonHandler::RegisterServerMetadata()
         TRITONSERVER_ErrorDelete(err);
       };
 
-  const auto it = restricted_keys_.find("metadata");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::METADATA);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<inference::ServerMetadataResponse>,
       inference::ServerMetadataRequest, inference::ServerMetadataResponse>(
       "ServerMetadata", 0, OnRegisterServerMetadata, OnExecuteServerMetadata,
-      false /* async */, cq_, restricted_kv);
+      false /* async */, cq_, restricted_kv, response_delay_);
 }
 
 void
@@ -817,14 +828,13 @@ CommonHandler::RegisterModelMetadata()
     TRITONSERVER_ErrorDelete(err);
   };
 
-  const auto it = restricted_keys_.find("metadata");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::METADATA);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<inference::ModelMetadataResponse>,
       inference::ModelMetadataRequest, inference::ModelMetadataResponse>(
       "ModelMetadata", 0, OnRegisterModelMetadata, OnExecuteModelMetadata,
-      false /* async */, cq_, restricted_kv);
+      false /* async */, cq_, restricted_kv, response_delay_);
 }
 
 void
@@ -871,14 +881,13 @@ CommonHandler::RegisterModelConfig()
     TRITONSERVER_ErrorDelete(err);
   };
 
-  const auto it = restricted_keys_.find("model-config");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::MODEL_CONFIG);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<inference::ModelConfigResponse>,
       inference::ModelConfigRequest, inference::ModelConfigResponse>(
       "ModelConfig", 0, OnRegisterModelConfig, OnExecuteModelConfig,
-      false /* async */, cq_, restricted_kv);
+      false /* async */, cq_, restricted_kv, response_delay_);
 }
 
 void
@@ -966,225 +975,145 @@ CommonHandler::RegisterModelStatistics()
         GOTO_IF_ERR(err, earlyexit);
         statistics->set_execution_count(ucnt);
 
-        triton::common::TritonJson::Value infer_stats_json;
-        err = model_stat.MemberAsObject("inference_stats", &infer_stats_json);
-        GOTO_IF_ERR(err, earlyexit);
-
         {
-          triton::common::TritonJson::Value success_json;
-          err = infer_stats_json.MemberAsObject("success", &success_json);
+          triton::common::TritonJson::Value infer_stats_json;
+          err = model_stat.MemberAsObject("inference_stats", &infer_stats_json);
           GOTO_IF_ERR(err, earlyexit);
 
-          err = success_json.MemberAsUInt("count", &ucnt);
+          err = SetStatisticsDuration(
+              infer_stats_json, "success",
+              statistics->mutable_inference_stats()->mutable_success());
           GOTO_IF_ERR(err, earlyexit);
-          statistics->mutable_inference_stats()->mutable_success()->set_count(
-              ucnt);
-          err = success_json.MemberAsUInt("ns", &ucnt);
+          err = SetStatisticsDuration(
+              infer_stats_json, "fail",
+              statistics->mutable_inference_stats()->mutable_fail());
           GOTO_IF_ERR(err, earlyexit);
-          statistics->mutable_inference_stats()->mutable_success()->set_ns(
-              ucnt);
+          err = SetStatisticsDuration(
+              infer_stats_json, "queue",
+              statistics->mutable_inference_stats()->mutable_queue());
+          GOTO_IF_ERR(err, earlyexit);
+          err = SetStatisticsDuration(
+              infer_stats_json, "compute_input",
+              statistics->mutable_inference_stats()->mutable_compute_input());
+          GOTO_IF_ERR(err, earlyexit);
+          err = SetStatisticsDuration(
+              infer_stats_json, "compute_infer",
+              statistics->mutable_inference_stats()->mutable_compute_infer());
+          GOTO_IF_ERR(err, earlyexit);
+          err = SetStatisticsDuration(
+              infer_stats_json, "compute_output",
+              statistics->mutable_inference_stats()->mutable_compute_output());
+          GOTO_IF_ERR(err, earlyexit);
+          err = SetStatisticsDuration(
+              infer_stats_json, "cache_hit",
+              statistics->mutable_inference_stats()->mutable_cache_hit());
+          GOTO_IF_ERR(err, earlyexit);
+          err = SetStatisticsDuration(
+              infer_stats_json, "cache_miss",
+              statistics->mutable_inference_stats()->mutable_cache_miss());
+          GOTO_IF_ERR(err, earlyexit);
         }
 
         {
-          triton::common::TritonJson::Value fail_json;
-          err = infer_stats_json.MemberAsObject("fail", &fail_json);
+          triton::common::TritonJson::Value responses_json;
+          err = model_stat.MemberAsObject("response_stats", &responses_json);
           GOTO_IF_ERR(err, earlyexit);
 
-          err = fail_json.MemberAsUInt("count", &ucnt);
-          GOTO_IF_ERR(err, earlyexit);
-          statistics->mutable_inference_stats()->mutable_fail()->set_count(
-              ucnt);
-          err = fail_json.MemberAsUInt("ns", &ucnt);
-          GOTO_IF_ERR(err, earlyexit);
-          statistics->mutable_inference_stats()->mutable_fail()->set_ns(ucnt);
-        }
-
-        {
-          triton::common::TritonJson::Value queue_json;
-          err = infer_stats_json.MemberAsObject("queue", &queue_json);
+          std::vector<std::string> keys;
+          err = responses_json.Members(&keys);
           GOTO_IF_ERR(err, earlyexit);
 
-          err = queue_json.MemberAsUInt("count", &ucnt);
-          GOTO_IF_ERR(err, earlyexit);
-          statistics->mutable_inference_stats()->mutable_queue()->set_count(
-              ucnt);
-          err = queue_json.MemberAsUInt("ns", &ucnt);
-          GOTO_IF_ERR(err, earlyexit);
-          statistics->mutable_inference_stats()->mutable_queue()->set_ns(ucnt);
-        }
+          for (const auto& key : keys) {
+            triton::common::TritonJson::Value res_json;
+            err = responses_json.MemberAsObject(key.c_str(), &res_json);
+            GOTO_IF_ERR(err, earlyexit);
 
-        {
-          triton::common::TritonJson::Value compute_input_json;
-          err = infer_stats_json.MemberAsObject(
-              "compute_input", &compute_input_json);
-          GOTO_IF_ERR(err, earlyexit);
+            inference::InferResponseStatistics res;
 
-          err = compute_input_json.MemberAsUInt("count", &ucnt);
-          GOTO_IF_ERR(err, earlyexit);
-          statistics->mutable_inference_stats()
-              ->mutable_compute_input()
-              ->set_count(ucnt);
-          err = compute_input_json.MemberAsUInt("ns", &ucnt);
-          GOTO_IF_ERR(err, earlyexit);
-          statistics->mutable_inference_stats()
-              ->mutable_compute_input()
-              ->set_ns(ucnt);
-        }
-
-        {
-          triton::common::TritonJson::Value compute_infer_json;
-          err = infer_stats_json.MemberAsObject(
-              "compute_infer", &compute_infer_json);
-          GOTO_IF_ERR(err, earlyexit);
-
-          err = compute_infer_json.MemberAsUInt("count", &ucnt);
-          GOTO_IF_ERR(err, earlyexit);
-          statistics->mutable_inference_stats()
-              ->mutable_compute_infer()
-              ->set_count(ucnt);
-          err = compute_infer_json.MemberAsUInt("ns", &ucnt);
-          GOTO_IF_ERR(err, earlyexit);
-          statistics->mutable_inference_stats()
-              ->mutable_compute_infer()
-              ->set_ns(ucnt);
-        }
-
-        {
-          triton::common::TritonJson::Value compute_output_json;
-          err = infer_stats_json.MemberAsObject(
-              "compute_output", &compute_output_json);
-          GOTO_IF_ERR(err, earlyexit);
-
-          err = compute_output_json.MemberAsUInt("count", &ucnt);
-          GOTO_IF_ERR(err, earlyexit);
-          statistics->mutable_inference_stats()
-              ->mutable_compute_output()
-              ->set_count(ucnt);
-          err = compute_output_json.MemberAsUInt("ns", &ucnt);
-          GOTO_IF_ERR(err, earlyexit);
-          statistics->mutable_inference_stats()
-              ->mutable_compute_output()
-              ->set_ns(ucnt);
-        }
-
-        {
-          triton::common::TritonJson::Value cache_hit_json;
-          err = infer_stats_json.MemberAsObject("cache_hit", &cache_hit_json);
-          GOTO_IF_ERR(err, earlyexit);
-
-          err = cache_hit_json.MemberAsUInt("count", &ucnt);
-          GOTO_IF_ERR(err, earlyexit);
-          statistics->mutable_inference_stats()->mutable_cache_hit()->set_count(
-              ucnt);
-          err = cache_hit_json.MemberAsUInt("ns", &ucnt);
-          GOTO_IF_ERR(err, earlyexit);
-          statistics->mutable_inference_stats()->mutable_cache_hit()->set_ns(
-              ucnt);
-        }
-
-        {
-          triton::common::TritonJson::Value cache_miss_json;
-          err = infer_stats_json.MemberAsObject("cache_miss", &cache_miss_json);
-          GOTO_IF_ERR(err, earlyexit);
-
-          err = cache_miss_json.MemberAsUInt("count", &ucnt);
-          GOTO_IF_ERR(err, earlyexit);
-          statistics->mutable_inference_stats()
-              ->mutable_cache_miss()
-              ->set_count(ucnt);
-          err = cache_miss_json.MemberAsUInt("ns", &ucnt);
-          GOTO_IF_ERR(err, earlyexit);
-          statistics->mutable_inference_stats()->mutable_cache_miss()->set_ns(
-              ucnt);
-        }
-
-        triton::common::TritonJson::Value batches_json;
-        err = model_stat.MemberAsArray("batch_stats", &batches_json);
-        GOTO_IF_ERR(err, earlyexit);
-
-        for (size_t idx = 0; idx < batches_json.ArraySize(); ++idx) {
-          triton::common::TritonJson::Value batch_stat;
-          err = batches_json.IndexAsObject(idx, &batch_stat);
-          GOTO_IF_ERR(err, earlyexit);
-
-          auto batch_statistics = statistics->add_batch_stats();
-
-          uint64_t ucnt;
-          err = batch_stat.MemberAsUInt("batch_size", &ucnt);
-          GOTO_IF_ERR(err, earlyexit);
-          batch_statistics->set_batch_size(ucnt);
-
-          {
-            triton::common::TritonJson::Value compute_input_json;
+            err = SetStatisticsDuration(
+                res_json, "compute_infer", res.mutable_compute_infer());
+            GOTO_IF_ERR(err, earlyexit);
+            err = SetStatisticsDuration(
+                res_json, "compute_output", res.mutable_compute_output());
+            GOTO_IF_ERR(err, earlyexit);
+            err = SetStatisticsDuration(
+                res_json, "success", res.mutable_success());
+            GOTO_IF_ERR(err, earlyexit);
+            err = SetStatisticsDuration(res_json, "fail", res.mutable_fail());
+            GOTO_IF_ERR(err, earlyexit);
+            err = SetStatisticsDuration(
+                res_json, "empty_response", res.mutable_empty_response());
+            GOTO_IF_ERR(err, earlyexit);
             err =
-                batch_stat.MemberAsObject("compute_input", &compute_input_json);
+                SetStatisticsDuration(res_json, "cancel", res.mutable_cancel());
             GOTO_IF_ERR(err, earlyexit);
 
-            err = compute_input_json.MemberAsUInt("count", &ucnt);
-            GOTO_IF_ERR(err, earlyexit);
-            batch_statistics->mutable_compute_input()->set_count(ucnt);
-            err = compute_input_json.MemberAsUInt("ns", &ucnt);
-            GOTO_IF_ERR(err, earlyexit);
-            batch_statistics->mutable_compute_input()->set_ns(ucnt);
-          }
-
-          {
-            triton::common::TritonJson::Value compute_infer_json;
-            err =
-                batch_stat.MemberAsObject("compute_infer", &compute_infer_json);
-            GOTO_IF_ERR(err, earlyexit);
-
-            err = compute_infer_json.MemberAsUInt("count", &ucnt);
-            GOTO_IF_ERR(err, earlyexit);
-            batch_statistics->mutable_compute_infer()->set_count(ucnt);
-            err = compute_infer_json.MemberAsUInt("ns", &ucnt);
-            GOTO_IF_ERR(err, earlyexit);
-            batch_statistics->mutable_compute_infer()->set_ns(ucnt);
-          }
-
-          {
-            triton::common::TritonJson::Value compute_output_json;
-            err = batch_stat.MemberAsObject(
-                "compute_output", &compute_output_json);
-            GOTO_IF_ERR(err, earlyexit);
-
-            err = compute_output_json.MemberAsUInt("count", &ucnt);
-            GOTO_IF_ERR(err, earlyexit);
-            batch_statistics->mutable_compute_output()->set_count(ucnt);
-            err = compute_output_json.MemberAsUInt("ns", &ucnt);
-            GOTO_IF_ERR(err, earlyexit);
-            batch_statistics->mutable_compute_output()->set_ns(ucnt);
+            (*statistics->mutable_response_stats())[key] = std::move(res);
           }
         }
 
-        triton::common::TritonJson::Value memory_usage_json;
-        err = model_stat.MemberAsArray("memory_usage", &memory_usage_json);
-        GOTO_IF_ERR(err, earlyexit);
-
-        for (size_t idx = 0; idx < memory_usage_json.ArraySize(); ++idx) {
-          triton::common::TritonJson::Value usage;
-          err = memory_usage_json.IndexAsObject(idx, &usage);
+        {
+          triton::common::TritonJson::Value batches_json;
+          err = model_stat.MemberAsArray("batch_stats", &batches_json);
           GOTO_IF_ERR(err, earlyexit);
 
-          auto memory_usage = statistics->add_memory_usage();
-          {
-            const char* type;
-            size_t type_len;
-            err = usage.MemberAsString("type", &type, &type_len);
+          for (size_t idx = 0; idx < batches_json.ArraySize(); ++idx) {
+            triton::common::TritonJson::Value batch_stat;
+            err = batches_json.IndexAsObject(idx, &batch_stat);
             GOTO_IF_ERR(err, earlyexit);
-            memory_usage->set_type(std::string(type, type_len));
+
+            auto batch_statistics = statistics->add_batch_stats();
+
+            uint64_t ucnt;
+            err = batch_stat.MemberAsUInt("batch_size", &ucnt);
+            GOTO_IF_ERR(err, earlyexit);
+            batch_statistics->set_batch_size(ucnt);
+
+            err = SetStatisticsDuration(
+                batch_stat, "compute_input",
+                batch_statistics->mutable_compute_input());
+            GOTO_IF_ERR(err, earlyexit);
+            err = SetStatisticsDuration(
+                batch_stat, "compute_infer",
+                batch_statistics->mutable_compute_infer());
+            GOTO_IF_ERR(err, earlyexit);
+            err = SetStatisticsDuration(
+                batch_stat, "compute_output",
+                batch_statistics->mutable_compute_output());
+            GOTO_IF_ERR(err, earlyexit);
           }
-          {
-            int64_t id;
-            err = usage.MemberAsInt("id", &id);
+        }
+
+        {
+          triton::common::TritonJson::Value memory_usage_json;
+          err = model_stat.MemberAsArray("memory_usage", &memory_usage_json);
+          GOTO_IF_ERR(err, earlyexit);
+
+          for (size_t idx = 0; idx < memory_usage_json.ArraySize(); ++idx) {
+            triton::common::TritonJson::Value usage;
+            err = memory_usage_json.IndexAsObject(idx, &usage);
             GOTO_IF_ERR(err, earlyexit);
-            memory_usage->set_id(id);
-          }
-          {
-            uint64_t byte_size;
-            err = usage.MemberAsUInt("byte_size", &byte_size);
-            GOTO_IF_ERR(err, earlyexit);
-            memory_usage->set_byte_size(byte_size);
+
+            auto memory_usage = statistics->add_memory_usage();
+            {
+              const char* type;
+              size_t type_len;
+              err = usage.MemberAsString("type", &type, &type_len);
+              GOTO_IF_ERR(err, earlyexit);
+              memory_usage->set_type(std::string(type, type_len));
+            }
+            {
+              int64_t id;
+              err = usage.MemberAsInt("id", &id);
+              GOTO_IF_ERR(err, earlyexit);
+              memory_usage->set_id(id);
+            }
+            {
+              uint64_t byte_size;
+              err = usage.MemberAsUInt("byte_size", &byte_size);
+              GOTO_IF_ERR(err, earlyexit);
+              memory_usage->set_byte_size(byte_size);
+            }
           }
         }
       }
@@ -1202,14 +1131,33 @@ CommonHandler::RegisterModelStatistics()
 #endif
   };
 
-  const auto it = restricted_keys_.find("statistics");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::STATISTICS);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<inference::ModelStatisticsResponse>,
       inference::ModelStatisticsRequest, inference::ModelStatisticsResponse>(
       "ModelStatistics", 0, OnRegisterModelStatistics, OnExecuteModelStatistics,
-      false /* async */, cq_, restricted_kv);
+      false /* async */, cq_, restricted_kv, response_delay_);
+}
+
+template <typename PBTYPE>
+TRITONSERVER_Error*
+CommonHandler::SetStatisticsDuration(
+    triton::common::TritonJson::Value& statistics_json,
+    const std::string& statistics_name,
+    PBTYPE* mutable_statistics_duration_protobuf) const
+{
+  triton::common::TritonJson::Value statistics_duration_json;
+  RETURN_IF_ERR(statistics_json.MemberAsObject(
+      statistics_name.c_str(), &statistics_duration_json));
+
+  uint64_t value;
+  RETURN_IF_ERR(statistics_duration_json.MemberAsUInt("count", &value));
+  mutable_statistics_duration_protobuf->set_count(value);
+  RETURN_IF_ERR(statistics_duration_json.MemberAsUInt("ns", &value));
+  mutable_statistics_duration_protobuf->set_ns(value);
+
+  return nullptr;
 }
 
 void
@@ -1236,6 +1184,8 @@ CommonHandler::RegisterTrace()
     int32_t count;
     uint32_t log_frequency;
     std::string filepath;
+    InferenceTraceMode trace_mode;
+    TraceConfigMap config_map;
 
     if (!request.model_name().empty()) {
       bool ready = false;
@@ -1260,18 +1210,11 @@ CommonHandler::RegisterTrace()
         static std::string setting_name = "trace_file";
         auto it = request.settings().find(setting_name);
         if (it != request.settings().end()) {
-          if (it->second.value().size() == 0) {
-            new_setting.clear_filepath_ = true;
-          } else if (it->second.value().size() == 1) {
-            filepath = it->second.value()[0];
-            new_setting.filepath_ = &filepath;
-          } else {
-            err = TRITONSERVER_ErrorNew(
-                TRITONSERVER_ERROR_INVALID_ARG,
-                (std::string("expect only 1 value for '") + setting_name + "'")
-                    .c_str());
-            GOTO_IF_ERR(err, earlyexit);
-          }
+          err = TRITONSERVER_ErrorNew(
+              TRITONSERVER_ERROR_UNSUPPORTED,
+              "trace file location can not be updated through network "
+              "protocol");
+          GOTO_IF_ERR(err, earlyexit);
         }
       }
       {
@@ -1443,7 +1386,8 @@ CommonHandler::RegisterTrace()
     // Get current trace setting, this is needed even if the setting
     // has been updated above as some values may not be provided in the request.
     trace_manager_->GetTraceSetting(
-        request.model_name(), &level, &rate, &count, &log_frequency, &filepath);
+        request.model_name(), &level, &rate, &count, &log_frequency, &filepath,
+        &trace_mode, &config_map);
     // level
     {
       inference::TraceSettingResponse::SettingValue level_setting;
@@ -1463,10 +1407,33 @@ CommonHandler::RegisterTrace()
         std::to_string(rate));
     (*response->mutable_settings())["trace_count"].add_value(
         std::to_string(count));
-    (*response->mutable_settings())["log_frequency"].add_value(
-        std::to_string(log_frequency));
-    (*response->mutable_settings())["trace_file"].add_value(filepath);
-
+    if (trace_mode == TRACE_MODE_TRITON) {
+      (*response->mutable_settings())["log_frequency"].add_value(
+          std::to_string(log_frequency));
+      (*response->mutable_settings())["trace_file"].add_value(filepath);
+    }
+    (*response->mutable_settings())["trace_mode"].add_value(
+        trace_manager_->InferenceTraceModeString(trace_mode));
+    {
+      auto mode_key = std::to_string(trace_mode);
+      auto trace_options_it = config_map.find(mode_key);
+      if (trace_options_it != config_map.end()) {
+        for (const auto& [key, value] : trace_options_it->second) {
+          if ((key == "file") || (key == "log-frequency")) {
+            continue;
+          }
+          std::string valueAsString;
+          if (std::holds_alternative<std::string>(value)) {
+            valueAsString = std::get<std::string>(value);
+          } else if (std::holds_alternative<int>(value)) {
+            valueAsString = std::to_string(std::get<int>(value));
+          } else if (std::holds_alternative<uint32_t>(value)) {
+            valueAsString = std::to_string(std::get<uint32_t>(value));
+          }
+          (*response->mutable_settings())[key].add_value(valueAsString);
+        }
+      }
+    }
   earlyexit:
     GrpcStatusUtil::Create(status, err);
     TRITONSERVER_ErrorDelete(err);
@@ -1478,14 +1445,13 @@ CommonHandler::RegisterTrace()
 #endif
   };
 
-  const auto it = restricted_keys_.find("trace");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::TRACE);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<inference::TraceSettingResponse>,
       inference::TraceSettingRequest, inference::TraceSettingResponse>(
       "Trace", 0, OnRegisterTrace, OnExecuteTrace, false /* async */, cq_,
-      restricted_kv);
+      restricted_kv, response_delay_);
 }
 
 void
@@ -1516,32 +1482,10 @@ CommonHandler::RegisterLogging()
         static std::string setting_name = "log_file";
         auto it = request.settings().find(setting_name);
         if (it != request.settings().end()) {
-          const auto& log_param = it->second;
-          if (log_param.parameter_choice_case() !=
-              inference::LogSettingsRequest_SettingValue::ParameterChoiceCase::
-                  kStringParam) {
-            err = TRITONSERVER_ErrorNew(
-                TRITONSERVER_ERROR_INVALID_ARG,
-                (std::string("expect string for '") + setting_name + "'")
-                    .c_str());
-            GOTO_IF_ERR(err, earlyexit);
-          } else {
-            // Set new settings in server then in core
-            const std::string& log_file_path = it->second.string_param();
-            const std::string& error = LOG_SET_OUT_FILE(log_file_path);
-            if (!error.empty()) {
-              err = TRITONSERVER_ErrorNew(
-                  TRITONSERVER_ERROR_INTERNAL, (error).c_str());
-              GOTO_IF_ERR(err, earlyexit);
-            }
-            // Okay to pass nullptr because we know the update will be applied
-            // to the global object.
-            err = TRITONSERVER_ServerOptionsSetLogFile(
-                nullptr, log_file_path.c_str());
-            if (err != nullptr) {
-              GOTO_IF_ERR(err, earlyexit);
-            }
-          }
+          err = TRITONSERVER_ErrorNew(
+              TRITONSERVER_ERROR_UNSUPPORTED,
+              "log file location can not be updated through network protocol");
+          GOTO_IF_ERR(err, earlyexit);
         }
       }
       {
@@ -1688,14 +1632,13 @@ CommonHandler::RegisterLogging()
 #endif
   };
 
-  const auto it = restricted_keys_.find("logging");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::LOGGING);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<inference::LogSettingsResponse>,
       inference::LogSettingsRequest, inference::LogSettingsResponse>(
       "Logging", 0, OnRegisterLogging, OnExecuteLogging, false /* async */, cq_,
-      restricted_kv);
+      restricted_kv, response_delay_);
 }
 
 void
@@ -1761,16 +1704,16 @@ CommonHandler::RegisterSystemSharedMemoryStatus()
         TRITONSERVER_ErrorDelete(err);
       };
 
-  const auto it = restricted_keys_.find("shared-memory");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::SHARED_MEMORY);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<
           inference::SystemSharedMemoryStatusResponse>,
       inference::SystemSharedMemoryStatusRequest,
       inference::SystemSharedMemoryStatusResponse>(
       "SystemSharedMemoryStatus", 0, OnRegisterSystemSharedMemoryStatus,
-      OnExecuteSystemSharedMemoryStatus, false /* async */, cq_, restricted_kv);
+      OnExecuteSystemSharedMemoryStatus, false /* async */, cq_, restricted_kv,
+      response_delay_);
 }
 
 void
@@ -1800,9 +1743,8 @@ CommonHandler::RegisterSystemSharedMemoryRegister()
         TRITONSERVER_ErrorDelete(err);
       };
 
-  const auto it = restricted_keys_.find("shared-memory");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::SHARED_MEMORY);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<
           inference::SystemSharedMemoryRegisterResponse>,
@@ -1810,7 +1752,7 @@ CommonHandler::RegisterSystemSharedMemoryRegister()
       inference::SystemSharedMemoryRegisterResponse>(
       "SystemSharedMemoryRegister", 0, OnRegisterSystemSharedMemoryRegister,
       OnExecuteSystemSharedMemoryRegister, false /* async */, cq_,
-      restricted_kv);
+      restricted_kv, response_delay_);
 }
 
 void
@@ -1844,9 +1786,8 @@ CommonHandler::RegisterSystemSharedMemoryUnregister()
         TRITONSERVER_ErrorDelete(err);
       };
 
-  const auto it = restricted_keys_.find("shared-memory");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::SHARED_MEMORY);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<
           inference::SystemSharedMemoryUnregisterResponse>,
@@ -1854,7 +1795,7 @@ CommonHandler::RegisterSystemSharedMemoryUnregister()
       inference::SystemSharedMemoryUnregisterResponse>(
       "SystemSharedMemoryUnregister", 0, OnRegisterSystemSharedMemoryUnregister,
       OnExecuteSystemSharedMemoryUnregister, false /* async */, cq_,
-      restricted_kv);
+      restricted_kv, response_delay_);
 }
 
 void
@@ -1912,16 +1853,16 @@ CommonHandler::RegisterCudaSharedMemoryStatus()
         TRITONSERVER_ErrorDelete(err);
       };
 
-  const auto it = restricted_keys_.find("shared-memory");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::SHARED_MEMORY);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<
           inference::CudaSharedMemoryStatusResponse>,
       inference::CudaSharedMemoryStatusRequest,
       inference::CudaSharedMemoryStatusResponse>(
       "CudaSharedMemoryStatus", 0, OnRegisterCudaSharedMemoryStatus,
-      OnExecuteCudaSharedMemoryStatus, false /* async */, cq_, restricted_kv);
+      OnExecuteCudaSharedMemoryStatus, false /* async */, cq_, restricted_kv,
+      response_delay_);
 }
 
 void
@@ -1963,16 +1904,16 @@ CommonHandler::RegisterCudaSharedMemoryRegister()
         TRITONSERVER_ErrorDelete(err);
       };
 
-  const auto it = restricted_keys_.find("shared-memory");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::SHARED_MEMORY);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<
           inference::CudaSharedMemoryRegisterResponse>,
       inference::CudaSharedMemoryRegisterRequest,
       inference::CudaSharedMemoryRegisterResponse>(
       "CudaSharedMemoryRegister", 0, OnRegisterCudaSharedMemoryRegister,
-      OnExecuteCudaSharedMemoryRegister, false /* async */, cq_, restricted_kv);
+      OnExecuteCudaSharedMemoryRegister, false /* async */, cq_, restricted_kv,
+      response_delay_);
 }
 
 void
@@ -2005,10 +1946,9 @@ CommonHandler::RegisterCudaSharedMemoryUnregister()
         GrpcStatusUtil::Create(status, err);
         TRITONSERVER_ErrorDelete(err);
       };
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::SHARED_MEMORY);
 
-  const auto it = restricted_keys_.find("shared-memory");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<
           inference::CudaSharedMemoryUnregisterResponse>,
@@ -2016,7 +1956,7 @@ CommonHandler::RegisterCudaSharedMemoryUnregister()
       inference::CudaSharedMemoryUnregisterResponse>(
       "CudaSharedMemoryUnregister", 0, OnRegisterCudaSharedMemoryUnregister,
       OnExecuteCudaSharedMemoryUnregister, false /* async */, cq_,
-      restricted_kv);
+      restricted_kv, response_delay_);
 }
 
 void
@@ -2112,14 +2052,13 @@ CommonHandler::RegisterRepositoryIndex()
         TRITONSERVER_ErrorDelete(err);
       };
 
-  const auto it = restricted_keys_.find("model-repository");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::MODEL_REPOSITORY);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<inference::RepositoryIndexResponse>,
       inference::RepositoryIndexRequest, inference::RepositoryIndexResponse>(
       "RepositoryIndex", 0, OnRegisterRepositoryIndex, OnExecuteRepositoryIndex,
-      false /* async */, cq_, restricted_kv);
+      false /* async */, cq_, restricted_kv, response_delay_);
 }
 
 void
@@ -2224,15 +2163,15 @@ CommonHandler::RegisterRepositoryModelLoad()
         TRITONSERVER_ErrorDelete(err);
       };
 
-  const auto it = restricted_keys_.find("model-repository");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::MODEL_REPOSITORY);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<inference::RepositoryModelLoadResponse>,
       inference::RepositoryModelLoadRequest,
       inference::RepositoryModelLoadResponse>(
       "RepositoryModelLoad", 0, OnRegisterRepositoryModelLoad,
-      OnExecuteRepositoryModelLoad, true /* async */, cq_, restricted_kv);
+      OnExecuteRepositoryModelLoad, true /* async */, cq_, restricted_kv,
+      response_delay_);
 }
 
 void
@@ -2293,16 +2232,16 @@ CommonHandler::RegisterRepositoryModelUnload()
         TRITONSERVER_ErrorDelete(err);
       };
 
-  const auto it = restricted_keys_.find("model-repository");
-  std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys_.end()) ? empty_restricted_key_ : it->second;
+  const std::pair<std::string, std::string>& restricted_kv =
+      restricted_keys_.Get(RestrictedCategory::MODEL_REPOSITORY);
   new CommonCallData<
       ::grpc::ServerAsyncResponseWriter<
           inference::RepositoryModelUnloadResponse>,
       inference::RepositoryModelUnloadRequest,
       inference::RepositoryModelUnloadResponse>(
       "RepositoryModelUnload", 0, OnRegisterRepositoryModelUnload,
-      OnExecuteRepositoryModelUnload, true /* async */, cq_, restricted_kv);
+      OnExecuteRepositoryModelUnload, true /* async */, cq_, restricted_kv,
+      response_delay_);
 }
 
 }  // namespace
@@ -2371,6 +2310,16 @@ Server::Server(
     builder_.AddChannelArgument(
         GRPC_ARG_HTTP2_MAX_PING_STRIKES,
         keepalive_options.http2_max_ping_strikes_);
+    if (keepalive_options.max_connection_age_ms_ != 0) {
+      builder_.AddChannelArgument(
+          GRPC_ARG_MAX_CONNECTION_AGE_MS,
+          keepalive_options.max_connection_age_ms_);
+    }
+    if (keepalive_options.max_connection_age_grace_ms_ != 0) {
+      builder_.AddChannelArgument(
+          GRPC_ARG_MAX_CONNECTION_AGE_GRACE_MS,
+          keepalive_options.max_connection_age_grace_ms_);
+    }
 
     std::vector<std::string> headers{"GRPC KeepAlive Option", "Value"};
     triton::common::TablePrinter table_printer(headers);
@@ -2404,42 +2353,43 @@ Server::Server(
         "http2_max_ping_strikes",
         std::to_string(keepalive_options.http2_max_ping_strikes_)};
     table_printer.InsertRow(row);
-    LOG_VERBOSE(1) << table_printer.PrintTable();
+
+    if (keepalive_options.max_connection_age_ms_ != 0) {
+      row = {
+          "max_connection_age_ms",
+          std::to_string(keepalive_options.max_connection_age_ms_)};
+      table_printer.InsertRow(row);
+    }
+
+    if (keepalive_options.max_connection_age_grace_ms_ != 0) {
+      row = {
+          "max_connection_age_grace_ms",
+          std::to_string(keepalive_options.max_connection_age_grace_ms_)};
+      table_printer.InsertRow(row);
+    }
+    LOG_TABLE_VERBOSE(1, table_printer);
   }
 
   common_cq_ = builder_.AddCompletionQueue();
   model_infer_cq_ = builder_.AddCompletionQueue();
   model_stream_infer_cq_ = builder_.AddCompletionQueue();
 
-  // Read and set restriction for each protocol specified
-  // map from protocol name to a pair of header to look for and the key
-  std::map<std::string, std::pair<std::string, std::string>> restricted_keys;
-  for (const auto& pg : options.protocol_groups_) {
-    for (const auto& p : pg.protocols_) {
-      if (restricted_keys.find(p) != restricted_keys.end()) {
-        throw std::invalid_argument(
-            std::string("protocol '") + p +
-            "' can not be "
-            "specified in multiple config group");
-      }
-      const auto header = std::string(kRestrictedProtocolHeaderTemplate) +
-                          pg.restricted_key_.first;
-      restricted_keys[p] = std::make_pair(header, pg.restricted_key_.second);
-    }
+  // For testing purposes only, add artificial delay in grpc responses.
+  const char* dstr = getenv("TRITONSERVER_SERVER_DELAY_GRPC_RESPONSE_SEC");
+  uint64_t response_delay = 0;
+  if (dstr != nullptr) {
+    response_delay = atoi(dstr);
   }
-
   // A common Handler for other non-inference requests
   common_handler_.reset(new CommonHandler(
       "CommonHandler", tritonserver_, shm_manager_, trace_manager_, &service_,
-      &health_service_, common_cq_.get(), restricted_keys));
+      &health_service_, common_cq_.get(), options.restricted_protocols_,
+      response_delay));
 
   // [FIXME] "register" logic is different for infer
   // Handler for model inference requests.
-  const auto it = restricted_keys.find("inference");
   std::pair<std::string, std::string> restricted_kv =
-      (it == restricted_keys.end())
-          ? std::pair<std::string, std::string>{"", ""}
-          : it->second;
+      options.restricted_protocols_.Get(RestrictedCategory::INFERENCE);
   for (int i = 0; i < REGISTER_GRPC_INFER_THREAD_COUNT; ++i) {
     model_infer_handlers_.emplace_back(new ModelInferHandler(
         "ModelInferHandler", tritonserver_, trace_manager_, shm_manager_,
